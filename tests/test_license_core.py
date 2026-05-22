@@ -11,6 +11,9 @@ from src.license_core import load_and_verify_license, LicenseError
 FINGERPRINT = "a" * 64
 FEATURES = ["rag_chat", "transcriber"]
 NOW = datetime(2026, 5, 22, 15, 0, 0, tzinfo=timezone.utc)
+# Issue license starting 10 min before NOW, valid for 30 min.
+# This ensures NOW and NOW-5min are both inside the validity window.
+LICENSE_START = NOW - timedelta(minutes=10)
 
 
 @pytest.fixture()
@@ -19,7 +22,7 @@ def env(tmp_path):
     pub = tmp_path / "public_key.pem"
     generate_keypair(priv, pub)
     db = tmp_path / "seats.db"
-    lic_obj = issue_license(FINGERPRINT, FEATURES, priv, db, minutes_valid=10, now=NOW)
+    lic_obj = issue_license(FINGERPRINT, FEATURES, priv, db, minutes_valid=30, now=LICENSE_START)
     lic_path = tmp_path / "license.json"
     lic_path.write_text(json.dumps(lic_obj))
     last_seen = tmp_path / "last_seen.json"
@@ -52,7 +55,9 @@ def test_tampered_payload_raises(env):
 
 
 def test_clock_rollback_raises(env):
+    # First call at NOW sets last_seen
     load_and_verify_license(env["lic"], env["pub"], FINGERPRINT, env["last_seen"], now=NOW)
+    # Second call 5 min earlier — still inside validity window, but behind last_seen
     earlier = NOW - timedelta(minutes=5)
     with pytest.raises(LicenseError, match="Clock rollback"):
         load_and_verify_license(env["lic"], env["pub"], FINGERPRINT, env["last_seen"], now=earlier)
