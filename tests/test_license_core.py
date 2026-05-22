@@ -19,7 +19,7 @@ def env(tmp_path):
     pub = tmp_path / "public_key.pem"
     generate_keypair(priv, pub)
     db = tmp_path / "seats.db"
-    lic_obj = issue_license(FINGERPRINT, FEATURES, priv, db, minutes_valid=10)
+    lic_obj = issue_license(FINGERPRINT, FEATURES, priv, db, minutes_valid=10, now=NOW)
     lic_path = tmp_path / "license.json"
     lic_path.write_text(json.dumps(lic_obj))
     last_seen = tmp_path / "last_seen.json"
@@ -52,9 +52,7 @@ def test_tampered_payload_raises(env):
 
 
 def test_clock_rollback_raises(env):
-    # First call sets last_seen to NOW
     load_and_verify_license(env["lic"], env["pub"], FINGERPRINT, env["last_seen"], now=NOW)
-    # Second call with earlier time triggers rollback
     earlier = NOW - timedelta(minutes=5)
     with pytest.raises(LicenseError, match="Clock rollback"):
         load_and_verify_license(env["lic"], env["pub"], FINGERPRINT, env["last_seen"], now=earlier)

@@ -3,7 +3,7 @@ import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -44,13 +44,16 @@ def issue_license(
     db_path: Path,
     max_seats: int = 2,
     minutes_valid: int = 5,
+    now: Optional[datetime] = None,
 ) -> dict:
     conn = _init_db(db_path)
     if _seat_count(conn) >= max_seats:
         raise SeatCapError(f"Seat cap reached ({max_seats})")
 
+    if now is None:
+        now = datetime.now(timezone.utc)
+
     private_key = _load_private_key(private_key_path)
-    now = datetime.now(timezone.utc)
     payload = {
         "license_id": f"L-{_seat_count(conn) + 1:04d}",
         "customer": "DemoCorp",
