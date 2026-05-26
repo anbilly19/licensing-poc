@@ -5,11 +5,11 @@ import hashlib
 import hmac
 import json
 import platform
-import sys
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from cryptography.hazmat.primitives import serialization
 
@@ -52,8 +52,29 @@ def _last_seen_hmac_key(public_key_path: Path) -> bytes:
     return hashlib.sha256(public_key_path.read_bytes()).digest()
 
 
-def _sign_last_seen(ts: str, key: bytes) -> str:
-    return hmac.new(key, ts.encode(), hashlib.sha256).hexdigest()
+def _get_mirror_path() -> Path:
+    """Return platform-specific mirror storage path."""
+    system = platform.system()
+    if system == "Windows":
+        appdata = os.environ.get("APPDATA", str(Path.home()))
+        mirror_dir = Path(appdata) / "OneMachine"
+    else:
+        # Linux and macOS
+        mirror_dir = Path.home() / ".local" / "share" / "onemachine"
+    mirror_dir.mkdir(parents=True, exist_ok=True)
+    return mirror_dir / "last_seen.json"
+
+
+def _hash_entry(ts: str, prev_hash: str) -> str:
+    """SHA-256 of the concatenated ts + prev_hash for chaining."""
+    raw = f"{ts}|{prev_hash}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _sign_entry(ts: str, prev_hash: str, key: bytes) -> str:
+    """HMAC-SHA256 over ts + prev_hash."""
+    raw = f"{ts}|{prev_hash}".encode("utf-8")
+    return hmac.new(key, raw, hashlib.sha256).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +82,6 @@ def _sign_last_seen(ts: str, key: bytes) -> str:
 # ---------------------------------------------------------------------------
 
 def _registry_write(sig: str) -> None:
-    """Write sig to HKCU registry. Silently skipped on non-Windows."""
     if not _is_windows():
         return
     try:
@@ -72,11 +92,10 @@ def _registry_write(sig: str) -> None:
         winreg.SetValueEx(key, _REGISTRY_VALUE, 0, winreg.REG_SZ, sig)
         winreg.CloseKey(key)
     except Exception:
-        pass  # Registry unavailable — degrade gracefully
+        pass
 
 
 def _registry_read() -> Optional[str]:
-    """Read sig from HKCU registry. Returns None if not found or non-Windows."""
     if not _is_windows():
         return None
     try:
@@ -94,66 +113,123 @@ def _registry_read() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# last_seen write / check
+# Read / write a last_seen entry (chained)
 # ---------------------------------------------------------------------------
 
-def _write_last_seen(now: datetime, last_seen_path: Path, key: bytes) -> None:
-    ts = now.isoformat().replace("+00:00", "Z")
-    sig = _sign_last_seen(ts, key)
-    last_seen_path.write_text(json.dumps({"last_seen": ts, "sig": sig}))
-    _registry_write(sig)  # mirror sig to registry on Windows
-
-
-def _check_clock_rollback(
-    now: datetime, last_seen_path: Path, public_key_path: Path
-) -> None:
-    key = _last_seen_hmac_key(public_key_path)
-    reg_sig = _registry_read()  # None on Linux/macOS or if key absent
-
-    if not last_seen_path.exists():
-        # File missing — check registry to detect deliberate deletion
-        if reg_sig is not None:
-            raise LicenseError(
-                "last_seen.json was deleted while a registry entry still exists. "
-                "Possible tamper attempt."
-            )
-        # First run: no file, no registry entry — allow and initialise
-        _write_last_seen(now, last_seen_path, key)
-        return
-
-    # File exists — validate its contents
+def _read_entry(path: Path, key: bytes) -> Tuple[str, str, str]:
+    """Read and validate a last_seen file. Returns (ts, prev_hash, entry_hash).
+    Raises LicenseError on malformed or tampered content.
+    """
     try:
-        data = json.loads(last_seen_path.read_text())
-        ts = data["last_seen"]
-        stored_sig = data["sig"]
+        data = json.loads(path.read_text())
+        ts: str = data["last_seen"]
+        prev_hash: str = data["prev_hash"]
+        stored_sig: str = data["sig"]
     except (KeyError, json.JSONDecodeError):
         raise LicenseError(
-            "last_seen.json is malformed or missing signature. "
-            "File may have been tampered with."
+            f"{path} is malformed or missing fields. Possible tamper."
         )
 
-    expected_sig = _sign_last_seen(ts, key)
+    expected_sig = _sign_entry(ts, prev_hash, key)
     if not hmac.compare_digest(stored_sig, expected_sig):
         raise LicenseError(
-            "last_seen.json signature invalid. "
-            "File has been tampered with."
+            f"{path} signature invalid. File has been tampered with."
         )
 
-    # Cross-check file sig against registry sig on Windows
-    if reg_sig is not None and not hmac.compare_digest(stored_sig, reg_sig):
+    entry_hash = _hash_entry(ts, prev_hash)
+    return ts, prev_hash, entry_hash
+
+
+def _write_entry(
+    path: Path,
+    ts: str,
+    prev_hash: str,
+    key: bytes,
+) -> str:
+    """Write a chained last_seen entry. Returns the new entry_hash."""
+    sig = _sign_entry(ts, prev_hash, key)
+    path.write_text(json.dumps({"last_seen": ts, "prev_hash": prev_hash, "sig": sig}))
+    return _hash_entry(ts, prev_hash)
+
+
+# ---------------------------------------------------------------------------
+# Clock rollback check
+# ---------------------------------------------------------------------------
+
+def _check_clock_rollback(
+    now: datetime,
+    last_seen_path: Path,
+    public_key_path: Path,
+) -> None:
+    key = _last_seen_hmac_key(public_key_path)
+    mirror_path = _get_mirror_path()
+    ts_now = now.isoformat().replace("+00:00", "Z")
+
+    primary_exists = last_seen_path.exists()
+    mirror_exists = mirror_path.exists()
+
+    # --- First run: neither file exists ---
+    if not primary_exists and not mirror_exists:
+        # Also check registry on Windows
+        if _registry_read() is not None:
+            raise LicenseError(
+                "last_seen files missing but registry entry exists. Possible tamper."
+            )
+        genesis_hash = "0" * 64
+        new_hash = _write_entry(last_seen_path, ts_now, genesis_hash, key)
+        _write_entry(mirror_path, ts_now, genesis_hash, key)
+        _registry_write(_sign_entry(ts_now, genesis_hash, key))
+        return
+
+    # --- Primary deleted but mirror exists ---
+    if not primary_exists and mirror_exists:
         raise LicenseError(
-            "last_seen.json does not match registry record. "
-            "File may have been replaced or tampered with."
+            "last_seen.json was deleted while a mirror entry still exists. "
+            "Possible tamper attempt."
         )
 
-    last_seen = _parse_iso(ts)
-    if now < last_seen:
+    # --- Mirror deleted but primary exists ---
+    if primary_exists and not mirror_exists:
+        raise LicenseError(
+            "Mirror last_seen was deleted while primary entry still exists. "
+            "Possible tamper attempt."
+        )
+
+    # --- Both exist: validate primary ---
+    ts_primary, prev_hash_primary, entry_hash_primary = _read_entry(last_seen_path, key)
+
+    # --- Validate mirror and cross-check chain hash ---
+    ts_mirror, prev_hash_mirror, entry_hash_mirror = _read_entry(mirror_path, key)
+
+    if not hmac.compare_digest(entry_hash_primary, entry_hash_mirror):
+        raise LicenseError(
+            "Primary and mirror last_seen do not match. "
+            "File swap or tamper attempt detected."
+        )
+
+    # --- Cross-check registry on Windows ---
+    reg_sig = _registry_read()
+    if reg_sig is not None:
+        expected_reg_sig = _sign_entry(ts_primary, prev_hash_primary, key)
+        if not hmac.compare_digest(reg_sig, expected_reg_sig):
+            raise LicenseError(
+                "last_seen.json does not match registry record. "
+                "File may have been replaced or tampered with."
+            )
+
+    # --- Clock rollback check ---
+    last_seen_dt = _parse_iso(ts_primary)
+    if now < last_seen_dt:
         raise LicenseError(
             f"Clock rollback detected (now={now.isoformat()}, "
-            f"last_seen={last_seen.isoformat()})."
+            f"last_seen={last_seen_dt.isoformat()})."
         )
 
-    _write_last_seen(now, last_seen_path, key)
+    # --- Write new chained entry ---
+    new_sig = _sign_entry(ts_now, entry_hash_primary, key)
+    _write_entry(last_seen_path, ts_now, entry_hash_primary, key)
+    _write_entry(mirror_path, ts_now, entry_hash_primary, key)
+    _registry_write(new_sig)
 
 
 # ---------------------------------------------------------------------------
