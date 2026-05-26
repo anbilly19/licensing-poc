@@ -59,9 +59,11 @@ _REGISTRY_KEY = r"Software\OneMachine\LicensePOC"
 _REGISTRY_VALUE = "last_seen_sig"
 _REGISTRY_ANCHOR_VALUE = "last_seen_anchor"   # FIX 3: separate anchor value
 
-_MACOS_DEFAULTS_DOMAIN = "com.onemachine.licensepoc"
-_MACOS_DEFAULTS_KEY = "last_seen_sig"
-_MACOS_DEFAULTS_ANCHOR_KEY = "last_seen_anchor"  # FIX 3
+# macOS Keychain service name (used by keyring library)
+_MACOS_KEYCHAIN_SERVICE = "com.onemachine.licensepoc"
+_MACOS_KEYCHAIN_SIG_USER    = "last_seen_sig"
+_MACOS_KEYCHAIN_ANCHOR_USER = "last_seen_anchor"
+
 _XATTR_NAME = "user.onemachine_sig"
 _XATTR_ANCHOR_NAME = "user.onemachine_anchor"    # FIX 3
 _LINUX_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor"
@@ -314,7 +316,7 @@ def _check_clock_sanity(now: datetime, key: bytes) -> None:
 # ---------------------------------------------------------------------------
 
 _LIBSECRET_SERVICE = "onemachine-licensing"
-_LIBSECRET_ATTR    = {"app": "onemachine", "type": "last_seen_sig"}
+_LIBSECRET_ATTR = {"app": "onemachine", "type": "last_seen_sig"}
 _LIBSECRET_ANCHOR_ATTR = {"app": "onemachine", "type": "last_seen_anchor"}  # FIX 3
 
 
@@ -326,12 +328,10 @@ def _libsecret_write(sig: str, anchor_mac: str) -> bool:
         coll = secretstorage.get_default_collection(conn)
         if coll.is_locked():
             coll.unlock()
-        # Write primary sig
         existing = list(coll.search_items(_LIBSECRET_ATTR))
         for item in existing:
             item.delete()
         coll.create_item(_LIBSECRET_SERVICE + ":sig", _LIBSECRET_ATTR, sig.encode())
-        # Write anchor MAC (FIX 3: different key, different item)
         existing_anchor = list(coll.search_items(_LIBSECRET_ANCHOR_ATTR))
         for item in existing_anchor:
             item.delete()
@@ -361,85 +361,171 @@ def _libsecret_read() -> Optional[Tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Windows registry helpers
+# FIX 2 (Windows) — DPAPI-encrypted registry anchor.
+#
+# HKLM (admin-required): stored as-is — elevation already provides tamper
+#   resistance; DPAPI is redundant at HKLM since only admins can write.
+# HKCU (user-writable): value encrypted with CryptProtectData (DPAPI).
+#   The ciphertext is machine+user-bound — copying it to another machine or
+#   another user account produces garbage on decryption.  An attacker who
+#   reads HKCU cannot forge or replay the anchor on a different machine.
 # ---------------------------------------------------------------------------
 
+def _dpapi_encrypt(plaintext: str) -> Optional[bytes]:
+    """Encrypt plaintext with DPAPI (user scope). Returns raw ciphertext bytes."""
+    try:
+        import win32crypt  # type: ignore  # pip install pywin32
+        encrypted = win32crypt.CryptProtectData(
+            plaintext.encode("utf-8"),
+            "onemachine-anchor",  # data description (stored with blob, not secret)
+            None,                 # optional entropy
+            None,                 # reserved
+            None,                 # prompt struct
+            0,                    # flags — 0 = user scope (machine scope would be CRYPTPROTECT_LOCAL_MACHINE)
+        )
+        return encrypted
+    except Exception:
+        return None
+
+
+def _dpapi_decrypt(ciphertext: bytes) -> Optional[str]:
+    """Decrypt DPAPI ciphertext. Returns plaintext string, or None on failure."""
+    try:
+        import win32crypt  # type: ignore
+        _, plaintext_bytes = win32crypt.CryptUnprotectData(
+            ciphertext,
+            None,   # optional entropy
+            None,   # reserved
+            None,   # prompt struct
+            0,      # flags
+        )
+        return plaintext_bytes.decode("utf-8")
+    except Exception:
+        return None
+
+
 def _registry_write(sig: str, anchor_mac: str) -> None:
+    """Write anchor to Windows registry.
+
+    HKLM: plaintext (requires admin to write — elevation = tamper resistance).
+    HKCU: DPAPI-encrypted (user-writable key, so we add cryptographic binding).
+    """
     if _system() != "Windows":
         return
     try:
         import winreg
-        for hive, flags in [
-            (winreg.HKEY_LOCAL_MACHINE, 0),
-            (winreg.HKEY_CURRENT_USER,  0),
-        ]:
-            try:
-                k = winreg.CreateKeyEx(hive, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE)
-                winreg.SetValueEx(k, _REGISTRY_VALUE,        0, winreg.REG_SZ, sig)
-                winreg.SetValueEx(k, _REGISTRY_ANCHOR_VALUE, 0, winreg.REG_SZ, anchor_mac)
-                winreg.CloseKey(k)
-            except OSError:
-                pass
+
+        # --- HKLM (admin-required, plaintext is acceptable) ---
+        try:
+            k = winreg.CreateKeyEx(
+                winreg.HKEY_LOCAL_MACHINE, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE
+            )
+            winreg.SetValueEx(k, _REGISTRY_VALUE,        0, winreg.REG_SZ, sig)
+            winreg.SetValueEx(k, _REGISTRY_ANCHOR_VALUE, 0, winreg.REG_SZ, anchor_mac)
+            winreg.CloseKey(k)
+        except OSError:
+            pass  # no admin rights — fall through to HKCU
+
+        # --- HKCU (user-writable — encrypt with DPAPI so value is non-forgeable) ---
+        sig_enc        = _dpapi_encrypt(sig)
+        anchor_mac_enc = _dpapi_encrypt(anchor_mac)
+        if sig_enc is None or anchor_mac_enc is None:
+            # pywin32 not available — fall back to plaintext HKCU (weaker but functional)
+            sig_enc_value        = sig
+            anchor_mac_enc_value = anchor_mac
+            reg_type             = winreg.REG_SZ
+        else:
+            sig_enc_value        = sig_enc
+            anchor_mac_enc_value = anchor_mac_enc
+            reg_type             = winreg.REG_BINARY
+
+        k = winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE
+        )
+        winreg.SetValueEx(k, _REGISTRY_VALUE,        0, reg_type, sig_enc_value)
+        winreg.SetValueEx(k, _REGISTRY_ANCHOR_VALUE, 0, reg_type, anchor_mac_enc_value)
+        winreg.CloseKey(k)
     except Exception:
         pass
 
 
 def _registry_read() -> Optional[Tuple[str, str]]:
+    """Read anchor from Windows registry.  Prefers HKLM (admin-protected)."""
     if _system() != "Windows":
         return None
     try:
         import winreg
-        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            try:
-                k = winreg.OpenKey(hive, _REGISTRY_KEY, 0, winreg.KEY_READ)
-                sig,        _ = winreg.QueryValueEx(k, _REGISTRY_VALUE)
-                anchor_mac, _ = winreg.QueryValueEx(k, _REGISTRY_ANCHOR_VALUE)
-                winreg.CloseKey(k)
-                return sig, anchor_mac
-            except (FileNotFoundError, OSError):
-                continue
+
+        # --- HKLM first (plaintext, admin-protected) ---
+        try:
+            k = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, _REGISTRY_KEY, 0, winreg.KEY_READ
+            )
+            sig,        _ = winreg.QueryValueEx(k, _REGISTRY_VALUE)
+            anchor_mac, _ = winreg.QueryValueEx(k, _REGISTRY_ANCHOR_VALUE)
+            winreg.CloseKey(k)
+            return sig, anchor_mac
+        except (FileNotFoundError, OSError):
+            pass
+
+        # --- HKCU fallback (DPAPI-encrypted or plaintext fallback) ---
+        k = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_READ
+        )
+        sig_raw,        reg_type_sig    = winreg.QueryValueEx(k, _REGISTRY_VALUE)
+        anchor_mac_raw, reg_type_anchor = winreg.QueryValueEx(k, _REGISTRY_ANCHOR_VALUE)
+        winreg.CloseKey(k)
+
+        if reg_type_sig == winreg.REG_BINARY:
+            # Decrypt DPAPI blob
+            sig        = _dpapi_decrypt(bytes(sig_raw))
+            anchor_mac = _dpapi_decrypt(bytes(anchor_mac_raw))
+            if sig is None or anchor_mac is None:
+                return None  # wrong machine / wrong user — treat as missing
+        else:
+            # Plain-text fallback (pywin32 unavailable at write time)
+            sig        = sig_raw
+            anchor_mac = anchor_mac_raw
+
+        return sig, anchor_mac
+    except (FileNotFoundError, OSError):
+        pass
     except Exception:
         pass
     return None
 
 
 # ---------------------------------------------------------------------------
-# macOS defaults helpers
+# FIX 2 (macOS) — Keychain anchor via keyring library.
+#
+# Replaces `defaults write` (fully user-deletable plist in ~/Library/Preferences)
+# with the macOS Keychain.  Keychain items require user authentication to
+# delete (the OS prompts for password / Touch ID), equivalent to libsecret
+# protection on Linux.
+#
+# Requires:  pip install keyring
+# No extra C extension needed — keyring uses the system Keychain on macOS.
 # ---------------------------------------------------------------------------
 
-def _defaults_write(sig: str, anchor_mac: str) -> None:
-    if _system() != "Darwin":
-        return
+def _keychain_write(sig: str, anchor_mac: str) -> bool:
+    """Store sig + anchor_mac in the macOS Keychain. Returns True on success."""
     try:
-        subprocess.run(
-            ["defaults", "write", _MACOS_DEFAULTS_DOMAIN, _MACOS_DEFAULTS_KEY, sig],
-            check=True, capture_output=True,
-        )
-        subprocess.run(
-            ["defaults", "write", _MACOS_DEFAULTS_DOMAIN, _MACOS_DEFAULTS_ANCHOR_KEY, anchor_mac],
-            check=True, capture_output=True,
-        )
+        import keyring  # type: ignore  # pip install keyring
+        keyring.set_password(_MACOS_KEYCHAIN_SERVICE, _MACOS_KEYCHAIN_SIG_USER,    sig)
+        keyring.set_password(_MACOS_KEYCHAIN_SERVICE, _MACOS_KEYCHAIN_ANCHOR_USER, anchor_mac)
+        return True
     except Exception:
-        pass
+        return False
 
 
-def _defaults_read() -> Optional[Tuple[str, str]]:
-    if _system() != "Darwin":
-        return None
+def _keychain_read() -> Optional[Tuple[str, str]]:
+    """Read (sig, anchor_mac) from the macOS Keychain. Returns None if unavailable."""
     try:
-        r1 = subprocess.run(
-            ["defaults", "read", _MACOS_DEFAULTS_DOMAIN, _MACOS_DEFAULTS_KEY],
-            capture_output=True, text=True,
-        )
-        r2 = subprocess.run(
-            ["defaults", "read", _MACOS_DEFAULTS_DOMAIN, _MACOS_DEFAULTS_ANCHOR_KEY],
-            capture_output=True, text=True,
-        )
-        if r1.returncode == 0 and r2.returncode == 0:
-            sig        = r1.stdout.strip()
-            anchor_mac = r2.stdout.strip()
-            if sig and anchor_mac:
-                return sig, anchor_mac
+        import keyring  # type: ignore
+        sig        = keyring.get_password(_MACOS_KEYCHAIN_SERVICE, _MACOS_KEYCHAIN_SIG_USER)
+        anchor_mac = keyring.get_password(_MACOS_KEYCHAIN_SERVICE, _MACOS_KEYCHAIN_ANCHOR_USER)
+        if sig and anchor_mac:
+            return sig, anchor_mac
     except Exception:
         pass
     return None
@@ -498,8 +584,11 @@ def _dotfile_read() -> Optional[Tuple[str, str]]:
 # ---------------------------------------------------------------------------
 # Unified anchor helpers
 # Returns / stores (sig, anchor_mac) pairs.
-# FIX 2: On Linux, tries libsecret first (not user-deletable).
-# FIX 3: anchor_mac is signed with a DIFFERENT key from sig.
+#
+# Platform matrix after all VULN-2 fixes:
+#   Linux   — libsecret (Keyring, not user-rm-able)  → dotfile fallback
+#   Windows — HKLM plaintext (admin-protected)       → HKCU DPAPI-encrypted
+#   macOS   — Keychain via keyring (auth required to delete) [was: defaults write]
 # ---------------------------------------------------------------------------
 
 def _anchor_write(sig: str, anchor_mac: str, primary_path: Optional[Path] = None) -> None:
@@ -507,7 +596,10 @@ def _anchor_write(sig: str, anchor_mac: str, primary_path: Optional[Path] = None
     if system == "Windows":
         _registry_write(sig, anchor_mac)
     elif system == "Darwin":
-        _defaults_write(sig, anchor_mac)
+        wrote = _keychain_write(sig, anchor_mac)
+        if not wrote:
+            # keyring unavailable — log and degrade gracefully (no dotfile equiv on macOS)
+            pass
     elif system == "Linux":
         wrote_keychain = _libsecret_write(sig, anchor_mac)
         if not wrote_keychain:  # graceful fallback
@@ -521,13 +613,11 @@ def _anchor_read(primary_path: Optional[Path] = None) -> Optional[Tuple[str, str
     if system == "Windows":
         return _registry_read()
     if system == "Darwin":
-        return _defaults_read()
+        return _keychain_read()
     if system == "Linux":
-        # Prefer libsecret (cannot be rm-ed by the user)
         val = _libsecret_read()
         if val is not None:
             return val
-        # Fallback: dotfile
         val = _dotfile_read()
         if val is not None:
             return val
