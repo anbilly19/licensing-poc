@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import hmac
 import json
@@ -130,16 +131,18 @@ def _ntp_time() -> Optional[datetime]:
 
 
 # ---------------------------------------------------------------------------
-# Offline time source: boot-time anchor via /proc/uptime (Linux only)
+# Offline time source: platform-specific uptime
 #
-# Idea: record wall-clock time T and uptime U together.  On next run,
-# re-read uptime U'.  The machine’s real wall clock must be approximately
-# T + (U' - U).  If the current wall clock deviates from that estimate by
-# more than the tolerance, the clock was moved while the machine was running
-# (or a VM snapshot was restored with mismatched clock/uptime).
+# Each platform exposes the system uptime via a different API:
 #
-# The anchor is stored in the mirror directory as boot_anchor.json,
-# HMAC-signed with the same key as last_seen.
+#   Linux   — /proc/uptime  (seconds since boot as a float)
+#   macOS   — sysctl kern.boottime (struct timeval: tv_sec + tv_usec)
+#   Windows — GetTickCount64() (milliseconds since boot, wraps at ~49 days
+#             on 32-bit but is 64-bit since Vista so effectively unlimited)
+#
+# The uptime is combined with a stored wall-clock snapshot to form a
+# boot-time estimate of the current wall clock.  If the local clock deviates
+# from this estimate by more than _CLOCK_SKEW_TOLERANCE, we raise.
 # ---------------------------------------------------------------------------
 
 _BOOT_ANCHOR_FILENAME = "boot_anchor.json"
@@ -150,12 +153,56 @@ def _get_boot_anchor_path() -> Path:
 
 
 def _read_uptime_seconds() -> Optional[float]:
-    """Read current uptime in seconds from /proc/uptime (Linux only)."""
+    """
+    Return current system uptime in seconds.
+
+    Linux  : reads /proc/uptime
+    macOS  : calls sysctl kern.boottime (struct timeval), computes now - boot
+    Windows: calls GetTickCount64() via ctypes
+    """
+    system = _system()
     try:
-        raw = Path("/proc/uptime").read_text().split()[0]
-        return float(raw)
+        if system == "Linux":
+            raw = Path("/proc/uptime").read_text().split()[0]
+            return float(raw)
+
+        elif system == "Darwin":
+            # kern.boottime returns a struct timeval {tv_sec, tv_usec}
+            # Use sysctl -n kern.boottime and parse the output, or use ctypes.
+            # We use the subprocess approach (always available, no C extension needed).
+            result = subprocess.run(
+                ["sysctl", "-n", "kern.boottime"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if result.returncode != 0:
+                return None
+            # Output looks like: "{ sec = 1716720000, usec = 123456 } Tue May 26 ..."
+            raw = result.stdout
+            sec_part = [p for p in raw.split(",") if "sec" in p and "usec" not in p]
+            usec_part = [p for p in raw.split(",") if "usec" in p]
+            if not sec_part:
+                return None
+            boot_sec = int(sec_part[0].split("=")[1].strip().split()[0])
+            boot_usec = 0
+            if usec_part:
+                try:
+                    boot_usec = int(usec_part[0].split("=")[1].strip().split()[0])
+                except (ValueError, IndexError):
+                    pass
+            boot_epoch = boot_sec + boot_usec / 1_000_000
+            uptime = time.time() - boot_epoch
+            return uptime if uptime >= 0 else None
+
+        elif system == "Windows":
+            # GetTickCount64 returns milliseconds since boot (ULONGLONG).
+            get_tick = ctypes.windll.kernel32.GetTickCount64
+            get_tick.restype = ctypes.c_uint64
+            ms = get_tick()
+            return ms / 1000.0
+
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _boot_anchor_write(wall_ts: datetime, uptime_s: float, key: bytes) -> None:
@@ -192,7 +239,10 @@ def _boot_anchor_read(key: bytes) -> Optional[Tuple[datetime, float]]:
 def _boot_time_estimate(key: bytes) -> Optional[datetime]:
     """
     Estimate what the wall clock *should* be based on the stored anchor + elapsed uptime.
-    Returns None if /proc/uptime is unavailable or anchor is missing.
+    Returns None if uptime is unavailable or anchor is missing/stale.
+
+    Works on Linux (/proc/uptime), macOS (sysctl kern.boottime),
+    and Windows (GetTickCount64).
     """
     anchor = _boot_anchor_read(key)
     if anchor is None:
