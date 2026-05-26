@@ -22,6 +22,7 @@ _REGISTRY_KEY = r"Software\OneMachine\LicensePOC"
 _REGISTRY_VALUE = "last_seen_sig"
 _MACOS_DEFAULTS_DOMAIN = "com.onemachine.licensepoc"
 _MACOS_DEFAULTS_KEY = "last_seen_sig"
+_XATTR_NAME = "user.onemachine_sig"
 
 # Secret salt mixed into HMAC key derivation.
 # An attacker with only public_key.pem cannot derive the correct HMAC key
@@ -157,19 +158,51 @@ def _defaults_read() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Unified third-anchor helpers (registry on Windows, plist on macOS, no-op on Linux)
+# Linux xattr helpers — stored on the primary last_seen.json file itself.
+# xattrs are NOT copied by plain `cp` (requires --preserve=xattr),
+# so a naive file backup+restore drops the xattr and triggers tamper detection.
+# Degrades gracefully if the filesystem does not support xattrs.
 # ---------------------------------------------------------------------------
 
-def _anchor_write(sig: str) -> None:
+def _xattr_write(path: Path, sig: str) -> None:
+    if _system() != "Linux":
+        return
+    try:
+        os.setxattr(str(path), _XATTR_NAME, sig.encode("utf-8"))
+    except (OSError, AttributeError):
+        # Filesystem doesn't support xattrs — silently skip.
+        pass
+
+
+def _xattr_read(path: Path) -> Optional[str]:
+    if _system() != "Linux":
+        return None
+    try:
+        val = os.getxattr(str(path), _XATTR_NAME)
+        return val.decode("utf-8")
+    except (OSError, AttributeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Unified third-anchor helpers
+# Windows: registry, macOS: plist, Linux: xattr on primary file
+# ---------------------------------------------------------------------------
+
+def _anchor_write(sig: str, primary_path: Optional[Path] = None) -> None:
     _registry_write(sig)
     _defaults_write(sig)
+    if primary_path is not None:
+        _xattr_write(primary_path, sig)
 
 
-def _anchor_read() -> Optional[str]:
+def _anchor_read(primary_path: Optional[Path] = None) -> Optional[str]:
     if _system() == "Windows":
         return _registry_read()
     if _system() == "Darwin":
         return _defaults_read()
+    if _system() == "Linux" and primary_path is not None:
+        return _xattr_read(primary_path)
     return None
 
 
@@ -219,7 +252,7 @@ def _check_clock_rollback(
 
     # --- First run: neither file exists ---
     if not primary_exists and not mirror_exists:
-        anchor = _anchor_read()
+        anchor = _anchor_read(primary_path=last_seen_path)
         if anchor is not None:
             raise LicenseError(
                 "last_seen files missing but a system anchor entry exists. Possible tamper."
@@ -227,7 +260,7 @@ def _check_clock_rollback(
         genesis_hash = "0" * 64
         _write_entry(last_seen_path, ts_now, genesis_hash, key)
         _write_entry(mirror_path, ts_now, genesis_hash, key)
-        _anchor_write(_sign_entry(ts_now, genesis_hash, key))
+        _anchor_write(_sign_entry(ts_now, genesis_hash, key), primary_path=last_seen_path)
         return
 
     # --- Deletion detection ---
@@ -249,8 +282,8 @@ def _check_clock_rollback(
             "Primary and mirror last_seen do not match. File swap or tamper detected."
         )
 
-    # --- Third-anchor cross-check (Windows registry / macOS plist) ---
-    anchor_sig = _anchor_read()
+    # --- Third-anchor cross-check (Windows registry / macOS plist / Linux xattr) ---
+    anchor_sig = _anchor_read(primary_path=last_seen_path)
     if anchor_sig is not None:
         expected_anchor_sig = _sign_entry(ts_primary, prev_hash_primary, key)
         if not hmac.compare_digest(anchor_sig, expected_anchor_sig):
@@ -270,7 +303,7 @@ def _check_clock_rollback(
     new_sig = _sign_entry(ts_now, entry_hash_primary, key)
     _write_entry(last_seen_path, ts_now, entry_hash_primary, key)
     _write_entry(mirror_path, ts_now, entry_hash_primary, key)
-    _anchor_write(new_sig)
+    _anchor_write(new_sig, primary_path=last_seen_path)
 
 
 # ---------------------------------------------------------------------------
