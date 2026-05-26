@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.5.0)'
+        required: true
+        default: 'v0.5.0'
 
 jobs:
   build:
@@ -24,6 +30,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - uses: astral-sh/setup-uv@v6
         with:
@@ -60,6 +68,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -72,13 +82,22 @@ jobs:
           chmod +x release_artifacts/onemachine-license-linux || true
           chmod +x release_artifacts/onemachine-license-mac || true
 
+      - name: Resolve tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: "OneMachine Licensing POC ${{ github.ref_name }}"
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: "OneMachine Licensing POC ${{ steps.tag.outputs.name }}"
           body: |
-            ## OneMachine Licensing POC ${{ github.ref_name }}
+            ## OneMachine Licensing POC ${{ steps.tag.outputs.name }}
 
             > **No Python or uv required on client machines.** Download the binary, place two files next to it, run.
 
