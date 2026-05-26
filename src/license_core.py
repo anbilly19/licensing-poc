@@ -6,9 +6,13 @@ import hmac
 import json
 import platform
 import os
+import socket
+import struct
 import subprocess
+import time
+import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -30,9 +34,18 @@ _XATTR_NAME = "user.onemachine_sig"
 _LINUX_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor"
 
 # Secret salt mixed into HMAC key derivation.
-# An attacker with only public_key.pem cannot derive the correct HMAC key
-# without also knowing this salt, which is compiled into the binary via Nuitka.
 _HMAC_SALT = b"0m-p0c-s4lt-v1-d3f4ult-ch4ng3-b3f0r3-pr0d"
+
+# Clock sanity: maximum allowed divergence between local clock and any
+# external time source (NTP or boot-time estimate) before we reject.
+_CLOCK_SKEW_TOLERANCE = timedelta(seconds=90)
+
+# NTP servers to try in order.
+_NTP_SERVERS = ["time.cloudflare.com", "pool.ntp.org", "time.google.com"]
+_NTP_PORT = 123
+_NTP_TIMEOUT = 3  # seconds
+# Epoch offset: NTP epoch is 1 Jan 1900; Unix epoch is 1 Jan 1970.
+_NTP_DELTA = 2208988800
 
 
 @dataclass
@@ -62,16 +75,10 @@ def _parse_iso(ts: str) -> datetime:
 
 
 def _last_seen_hmac_key(public_key_path: Path) -> bytes:
-    """Derive a stable HMAC key from the salt + public key bytes.
-
-    The salt prevents an attacker who has public_key.pem (which all clients do)
-    from trivially computing the HMAC key and forging last_seen.json entries.
-    """
     return hashlib.sha256(_HMAC_SALT + public_key_path.read_bytes()).digest()
 
 
 def _get_mirror_path() -> Path:
-    """Return platform-specific mirror storage path."""
     system = _system()
     if system == "Windows":
         appdata = os.environ.get("APPDATA", str(Path.home()))
@@ -86,31 +93,172 @@ def _get_mirror_path() -> Path:
 
 
 def _hash_entry(ts: str, prev_hash: str) -> str:
-    """SHA-256 of ts + prev_hash for chain integrity."""
     raw = f"{ts}|{prev_hash}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
 
 def _sign_entry(ts: str, prev_hash: str, key: bytes) -> str:
-    """HMAC-SHA256 over ts + prev_hash."""
     raw = f"{ts}|{prev_hash}".encode("utf-8")
     return hmac.new(key, raw, hashlib.sha256).hexdigest()
 
 
 # ---------------------------------------------------------------------------
-# Windows registry helpers
+# Online time source: NTP (raw UDP)
+# Returns UTC datetime from NTP server, or None on any failure.
+# Uses raw UDP so there is no dependency beyond the stdlib.
 # ---------------------------------------------------------------------------
-# Write strategy: always attempt HKLM first (requires admin / elevated process),
-# then always write HKCU as well so there is always at least one anchor even
-# when running non-elevated.
+
+def _ntp_time() -> Optional[datetime]:
+    """Query NTP servers in order; return UTC datetime from the first that responds."""
+    # 48-byte NTP request packet: LI=0, VN=3, Mode=3 (client)
+    packet = b"\x1b" + b"\x00" * 47
+    for server in _NTP_SERVERS:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(_NTP_TIMEOUT)
+                s.sendto(packet, (server, _NTP_PORT))
+                data, _ = s.recvfrom(1024)
+            if len(data) < 48:
+                continue
+            # Transmit Timestamp is at bytes 40–43 (seconds since NTP epoch)
+            ntp_seconds = struct.unpack("!I", data[40:44])[0]
+            unix_ts = ntp_seconds - _NTP_DELTA
+            return datetime.fromtimestamp(unix_ts, tz=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Offline time source: boot-time anchor via /proc/uptime (Linux only)
 #
-# Read strategy: prefer HKLM (cannot be deleted without admin); fall back to
-# HKCU if HKLM key is absent (e.g., first ever run was non-elevated).
+# Idea: record wall-clock time T and uptime U together.  On next run,
+# re-read uptime U'.  The machine’s real wall clock must be approximately
+# T + (U' - U).  If the current wall clock deviates from that estimate by
+# more than the tolerance, the clock was moved while the machine was running
+# (or a VM snapshot was restored with mismatched clock/uptime).
 #
-# Attack resistance:
-#   - User-level attacker can delete HKCU but NOT HKLM → HKLM anchor survives.
-#   - Admin-level attacker can delete both → treated as first run only when
-#     both JSON files are also gone, which is the same floor as Linux.
+# The anchor is stored in the mirror directory as boot_anchor.json,
+# HMAC-signed with the same key as last_seen.
+# ---------------------------------------------------------------------------
+
+_BOOT_ANCHOR_FILENAME = "boot_anchor.json"
+
+
+def _get_boot_anchor_path() -> Path:
+    return _get_mirror_path().parent / _BOOT_ANCHOR_FILENAME
+
+
+def _read_uptime_seconds() -> Optional[float]:
+    """Read current uptime in seconds from /proc/uptime (Linux only)."""
+    try:
+        raw = Path("/proc/uptime").read_text().split()[0]
+        return float(raw)
+    except Exception:
+        return None
+
+
+def _boot_anchor_write(wall_ts: datetime, uptime_s: float, key: bytes) -> None:
+    """Persist wall clock + uptime pair, HMAC-signed."""
+    try:
+        path = _get_boot_anchor_path()
+        ts_str = wall_ts.isoformat().replace("+00:00", "Z")
+        payload = f"{ts_str}|{uptime_s:.6f}"
+        sig = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
+        path.write_text(json.dumps({"wall_ts": ts_str, "uptime_s": uptime_s, "sig": sig}))
+    except Exception:
+        pass
+
+
+def _boot_anchor_read(key: bytes) -> Optional[Tuple[datetime, float]]:
+    """Read and verify the boot anchor. Returns (wall_ts, uptime_s) or None."""
+    try:
+        path = _get_boot_anchor_path()
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text())
+        ts_str: str = data["wall_ts"]
+        uptime_s: float = float(data["uptime_s"])
+        stored_sig: str = data["sig"]
+        payload = f"{ts_str}|{uptime_s:.6f}"
+        expected_sig = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(stored_sig, expected_sig):
+            return None  # tampered or stale key
+        return _parse_iso(ts_str), uptime_s
+    except Exception:
+        return None
+
+
+def _boot_time_estimate(key: bytes) -> Optional[datetime]:
+    """
+    Estimate what the wall clock *should* be based on the stored anchor + elapsed uptime.
+    Returns None if /proc/uptime is unavailable or anchor is missing.
+    """
+    anchor = _boot_anchor_read(key)
+    if anchor is None:
+        return None
+    prev_wall, prev_uptime = anchor
+    current_uptime = _read_uptime_seconds()
+    if current_uptime is None:
+        return None
+    elapsed = current_uptime - prev_uptime
+    if elapsed < 0:
+        # Machine rebooted since anchor was written — anchor is stale, ignore.
+        return None
+    return prev_wall + timedelta(seconds=elapsed)
+
+
+# ---------------------------------------------------------------------------
+# Clock sanity check
+#
+# Rules:
+#   - Both sources available → BOTH must agree with local clock (within tolerance)
+#   - Only boot-time available → accept if it agrees
+#   - Only NTP available → accept if it agrees
+#   - Neither available → degrade gracefully (no rejection)
+# ---------------------------------------------------------------------------
+
+def _check_clock_sanity(now: datetime, key: bytes) -> None:
+    """
+    Compare the local clock against NTP (online) and the boot-time anchor (offline).
+    Raises LicenseError if any available source disagrees by more than the tolerance.
+    """
+    ntp_now = _ntp_time()
+    boot_estimate = _boot_time_estimate(key)
+
+    if ntp_now is not None and boot_estimate is not None:
+        # Both available — both must agree with local clock.
+        if abs(now - ntp_now) > _CLOCK_SKEW_TOLERANCE:
+            raise LicenseError(
+                f"System clock diverges from NTP by "
+                f"{abs(now - ntp_now).total_seconds():.0f}s — possible clock manipulation."
+            )
+        if abs(now - boot_estimate) > _CLOCK_SKEW_TOLERANCE:
+            raise LicenseError(
+                f"System clock diverges from boot-time estimate by "
+                f"{abs(now - boot_estimate).total_seconds():.0f}s — possible clock manipulation "
+                f"or VM snapshot restore."
+            )
+    elif ntp_now is not None:
+        # Only NTP available.
+        if abs(now - ntp_now) > _CLOCK_SKEW_TOLERANCE:
+            raise LicenseError(
+                f"System clock diverges from NTP by "
+                f"{abs(now - ntp_now).total_seconds():.0f}s — possible clock manipulation."
+            )
+    elif boot_estimate is not None:
+        # Only boot-time anchor available (offline).
+        if abs(now - boot_estimate) > _CLOCK_SKEW_TOLERANCE:
+            raise LicenseError(
+                f"System clock diverges from boot-time estimate by "
+                f"{abs(now - boot_estimate).total_seconds():.0f}s — possible clock manipulation "
+                f"or VM snapshot restore."
+            )
+    # Neither available — degrade gracefully.
+
+
+# ---------------------------------------------------------------------------
+# Windows registry helpers
 # ---------------------------------------------------------------------------
 
 def _registry_write(sig: str) -> None:
@@ -118,25 +266,16 @@ def _registry_write(sig: str) -> None:
         return
     try:
         import winreg
-        # Attempt HKLM (requires admin / elevated process).
         try:
             k = winreg.CreateKeyEx(
-                winreg.HKEY_LOCAL_MACHINE,
-                _REGISTRY_KEY,
-                0,
-                winreg.KEY_SET_VALUE,
+                winreg.HKEY_LOCAL_MACHINE, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE,
             )
             winreg.SetValueEx(k, _REGISTRY_VALUE, 0, winreg.REG_SZ, sig)
             winreg.CloseKey(k)
         except OSError:
-            # Not elevated — silently skip HKLM.
             pass
-        # Always write HKCU as well (guaranteed to succeed for current user).
         k = winreg.CreateKeyEx(
-            winreg.HKEY_CURRENT_USER,
-            _REGISTRY_KEY,
-            0,
-            winreg.KEY_SET_VALUE,
+            winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE,
         )
         winreg.SetValueEx(k, _REGISTRY_VALUE, 0, winreg.REG_SZ, sig)
         winreg.CloseKey(k)
@@ -149,7 +288,6 @@ def _registry_read() -> Optional[str]:
         return None
     try:
         import winreg
-        # Prefer HKLM — user cannot delete without elevation.
         for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
             try:
                 k = winreg.OpenKey(hive, _REGISTRY_KEY, 0, winreg.KEY_READ)
@@ -166,7 +304,7 @@ def _registry_read() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# macOS defaults (plist) helpers
+# macOS defaults helpers
 # ---------------------------------------------------------------------------
 
 def _defaults_write(sig: str) -> None:
@@ -175,8 +313,7 @@ def _defaults_write(sig: str) -> None:
     try:
         subprocess.run(
             ["defaults", "write", _MACOS_DEFAULTS_DOMAIN, _MACOS_DEFAULTS_KEY, sig],
-            check=True,
-            capture_output=True,
+            check=True, capture_output=True,
         )
     except Exception:
         pass
@@ -188,8 +325,7 @@ def _defaults_read() -> Optional[str]:
     try:
         result = subprocess.run(
             ["defaults", "read", _MACOS_DEFAULTS_DOMAIN, _MACOS_DEFAULTS_KEY],
-            capture_output=True,
-            text=True,
+            capture_output=True, text=True,
         )
         if result.returncode == 0:
             return result.stdout.strip() or None
@@ -222,7 +358,7 @@ def _xattr_read(path: Path) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Linux dotfile anchor — ~/.config/.onemachine/anchor
+# Linux dotfile anchor
 # ---------------------------------------------------------------------------
 
 def _dotfile_write(sig: str) -> None:
@@ -248,13 +384,10 @@ def _dotfile_read() -> Optional[str]:
 
 # ---------------------------------------------------------------------------
 # Unified anchor helpers
-# Windows: HKLM (preferred, admin-protected) + HKCU (fallback)
-# macOS:   plist (defaults)
-# Linux:   dotfile (~/.config/.onemachine/anchor) + xattr on primary file
 # ---------------------------------------------------------------------------
 
 def _anchor_write(sig: str, primary_path: Optional[Path] = None) -> None:
-    _registry_write(sig)   # writes HKLM if elevated, always writes HKCU
+    _registry_write(sig)
     _defaults_write(sig)
     _dotfile_write(sig)
     if primary_path is not None:
@@ -263,7 +396,7 @@ def _anchor_write(sig: str, primary_path: Optional[Path] = None) -> None:
 
 def _anchor_read(primary_path: Optional[Path] = None) -> Optional[str]:
     if _system() == "Windows":
-        return _registry_read()  # prefers HKLM, falls back to HKCU
+        return _registry_read()
     if _system() == "Darwin":
         return _defaults_read()
     if _system() == "Linux":
@@ -276,11 +409,10 @@ def _anchor_read(primary_path: Optional[Path] = None) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Read / write a last_seen entry (chained)
+# Read / write last_seen entry (chained)
 # ---------------------------------------------------------------------------
 
 def _read_entry(path: Path, key: bytes) -> Tuple[str, str, str]:
-    """Read and validate a last_seen file. Returns (ts, prev_hash, entry_hash)."""
     try:
         data = json.loads(path.read_text())
         ts: str = data["last_seen"]
@@ -288,16 +420,13 @@ def _read_entry(path: Path, key: bytes) -> Tuple[str, str, str]:
         stored_sig: str = data["sig"]
     except (KeyError, json.JSONDecodeError):
         raise LicenseError(f"{path} is malformed or missing fields. Possible tamper.")
-
     expected_sig = _sign_entry(ts, prev_hash, key)
     if not hmac.compare_digest(stored_sig, expected_sig):
         raise LicenseError(f"{path} signature invalid. File has been tampered with.")
-
     return ts, prev_hash, _hash_entry(ts, prev_hash)
 
 
 def _write_entry(path: Path, ts: str, prev_hash: str, key: bytes) -> str:
-    """Write a chained last_seen entry. Returns the new entry_hash."""
     sig = _sign_entry(ts, prev_hash, key)
     path.write_text(json.dumps({"last_seen": ts, "prev_hash": prev_hash, "sig": sig}))
     return _hash_entry(ts, prev_hash)
@@ -315,9 +444,13 @@ def _check_clock_rollback(
     key = _last_seen_hmac_key(public_key_path)
     mirror_path = _get_mirror_path()
     ts_now = now.isoformat().replace("+00:00", "Z")
+    uptime_now = _read_uptime_seconds()
 
     primary_exists = last_seen_path.exists()
     mirror_exists = mirror_path.exists()
+
+    # --- Clock sanity (NTP + boot-time) ---
+    _check_clock_sanity(now, key)
 
     # --- First run: neither file exists ---
     if not primary_exists and not mirror_exists:
@@ -330,6 +463,8 @@ def _check_clock_rollback(
         _write_entry(last_seen_path, ts_now, genesis_hash, key)
         _write_entry(mirror_path, ts_now, genesis_hash, key)
         _anchor_write(_sign_entry(ts_now, genesis_hash, key), primary_path=last_seen_path)
+        if uptime_now is not None:
+            _boot_anchor_write(now, uptime_now, key)
         return
 
     # --- Deletion detection ---
@@ -361,18 +496,20 @@ def _check_clock_rollback(
                 "File may have been replaced or tampered with."
             )
 
-    # --- Clock rollback ---
+    # --- Chain rollback ---
     last_seen_dt = _parse_iso(ts_primary)
     if now < last_seen_dt:
         raise LicenseError(
             f"Clock rollback detected (now={now.isoformat()}, last_seen={last_seen_dt.isoformat()})."
         )
 
-    # --- Write next chained entry ---
+    # --- Write next chained entry + refresh boot anchor ---
     new_sig = _sign_entry(ts_now, entry_hash_primary, key)
     _write_entry(last_seen_path, ts_now, entry_hash_primary, key)
     _write_entry(mirror_path, ts_now, entry_hash_primary, key)
     _anchor_write(new_sig, primary_path=last_seen_path)
+    if uptime_now is not None:
+        _boot_anchor_write(now, uptime_now, key)
 
 
 # ---------------------------------------------------------------------------
