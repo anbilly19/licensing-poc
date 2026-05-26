@@ -6,6 +6,7 @@ import hmac
 import json
 import platform
 import os
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,8 @@ DEFAULT_LAST_SEEN_PATH = Path("last_seen.json")
 
 _REGISTRY_KEY = r"Software\OneMachine\LicensePOC"
 _REGISTRY_VALUE = "last_seen_sig"
+_MACOS_DEFAULTS_DOMAIN = "com.onemachine.licensepoc"
+_MACOS_DEFAULTS_KEY = "last_seen_sig"
 
 
 @dataclass
@@ -37,8 +40,8 @@ class LicenseError(Exception):
     pass
 
 
-def _is_windows() -> bool:
-    return platform.system() == "Windows"
+def _system() -> str:
+    return platform.system()  # "Windows", "Darwin", "Linux"
 
 
 def _parse_iso(ts: str) -> datetime:
@@ -54,19 +57,22 @@ def _last_seen_hmac_key(public_key_path: Path) -> bytes:
 
 def _get_mirror_path() -> Path:
     """Return platform-specific mirror storage path."""
-    system = platform.system()
+    system = _system()
     if system == "Windows":
         appdata = os.environ.get("APPDATA", str(Path.home()))
         mirror_dir = Path(appdata) / "OneMachine"
+    elif system == "Darwin":
+        mirror_dir = Path.home() / "Library" / "Application Support" / "OneMachine"
     else:
-        # Linux and macOS
-        mirror_dir = Path.home() / ".local" / "share" / "onemachine"
+        # Linux / other POSIX
+        xdg = os.environ.get("XDG_DATA_HOME", "")
+        mirror_dir = (Path(xdg) if xdg else Path.home() / ".local" / "share") / "onemachine"
     mirror_dir.mkdir(parents=True, exist_ok=True)
     return mirror_dir / "last_seen.json"
 
 
 def _hash_entry(ts: str, prev_hash: str) -> str:
-    """SHA-256 of the concatenated ts + prev_hash for chaining."""
+    """SHA-256 of ts + prev_hash for chain integrity."""
     raw = f"{ts}|{prev_hash}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
@@ -78,33 +84,29 @@ def _sign_entry(ts: str, prev_hash: str, key: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Windows registry helpers (no-op on non-Windows)
+# Windows registry helpers
 # ---------------------------------------------------------------------------
 
 def _registry_write(sig: str) -> None:
-    if not _is_windows():
+    if _system() != "Windows":
         return
     try:
         import winreg
-        key = winreg.CreateKeyEx(
-            winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE
-        )
-        winreg.SetValueEx(key, _REGISTRY_VALUE, 0, winreg.REG_SZ, sig)
-        winreg.CloseKey(key)
+        k = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(k, _REGISTRY_VALUE, 0, winreg.REG_SZ, sig)
+        winreg.CloseKey(k)
     except Exception:
         pass
 
 
 def _registry_read() -> Optional[str]:
-    if not _is_windows():
+    if _system() != "Windows":
         return None
     try:
         import winreg
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_READ
-        )
-        value, _ = winreg.QueryValueEx(key, _REGISTRY_VALUE)
-        winreg.CloseKey(key)
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_READ)
+        value, _ = winreg.QueryValueEx(k, _REGISTRY_VALUE)
+        winreg.CloseKey(k)
         return value
     except FileNotFoundError:
         return None
@@ -113,39 +115,77 @@ def _registry_read() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# macOS defaults (plist) helpers
+# ---------------------------------------------------------------------------
+
+def _defaults_write(sig: str) -> None:
+    if _system() != "Darwin":
+        return
+    try:
+        subprocess.run(
+            ["defaults", "write", _MACOS_DEFAULTS_DOMAIN, _MACOS_DEFAULTS_KEY, sig],
+            check=True,
+            capture_output=True,
+        )
+    except Exception:
+        pass
+
+
+def _defaults_read() -> Optional[str]:
+    if _system() != "Darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["defaults", "read", _MACOS_DEFAULTS_DOMAIN, _MACOS_DEFAULTS_KEY],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+        return None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Unified third-anchor helpers (registry on Windows, plist on macOS, no-op on Linux)
+# ---------------------------------------------------------------------------
+
+def _anchor_write(sig: str) -> None:
+    _registry_write(sig)
+    _defaults_write(sig)
+
+
+def _anchor_read() -> Optional[str]:
+    if _system() == "Windows":
+        return _registry_read()
+    if _system() == "Darwin":
+        return _defaults_read()
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Read / write a last_seen entry (chained)
 # ---------------------------------------------------------------------------
 
 def _read_entry(path: Path, key: bytes) -> Tuple[str, str, str]:
-    """Read and validate a last_seen file. Returns (ts, prev_hash, entry_hash).
-    Raises LicenseError on malformed or tampered content.
-    """
+    """Read and validate a last_seen file. Returns (ts, prev_hash, entry_hash)."""
     try:
         data = json.loads(path.read_text())
         ts: str = data["last_seen"]
         prev_hash: str = data["prev_hash"]
         stored_sig: str = data["sig"]
     except (KeyError, json.JSONDecodeError):
-        raise LicenseError(
-            f"{path} is malformed or missing fields. Possible tamper."
-        )
+        raise LicenseError(f"{path} is malformed or missing fields. Possible tamper.")
 
     expected_sig = _sign_entry(ts, prev_hash, key)
     if not hmac.compare_digest(stored_sig, expected_sig):
-        raise LicenseError(
-            f"{path} signature invalid. File has been tampered with."
-        )
+        raise LicenseError(f"{path} signature invalid. File has been tampered with.")
 
-    entry_hash = _hash_entry(ts, prev_hash)
-    return ts, prev_hash, entry_hash
+    return ts, prev_hash, _hash_entry(ts, prev_hash)
 
 
-def _write_entry(
-    path: Path,
-    ts: str,
-    prev_hash: str,
-    key: bytes,
-) -> str:
+def _write_entry(path: Path, ts: str, prev_hash: str, key: bytes) -> str:
     """Write a chained last_seen entry. Returns the new entry_hash."""
     sig = _sign_entry(ts, prev_hash, key)
     path.write_text(json.dumps({"last_seen": ts, "prev_hash": prev_hash, "sig": sig}))
@@ -153,7 +193,7 @@ def _write_entry(
 
 
 # ---------------------------------------------------------------------------
-# Clock rollback check
+# Clock rollback + tamper check
 # ---------------------------------------------------------------------------
 
 def _check_clock_rollback(
@@ -170,66 +210,58 @@ def _check_clock_rollback(
 
     # --- First run: neither file exists ---
     if not primary_exists and not mirror_exists:
-        # Also check registry on Windows
-        if _registry_read() is not None:
+        anchor = _anchor_read()
+        if anchor is not None:
             raise LicenseError(
-                "last_seen files missing but registry entry exists. Possible tamper."
+                "last_seen files missing but a system anchor entry exists. Possible tamper."
             )
         genesis_hash = "0" * 64
-        new_hash = _write_entry(last_seen_path, ts_now, genesis_hash, key)
+        _write_entry(last_seen_path, ts_now, genesis_hash, key)
         _write_entry(mirror_path, ts_now, genesis_hash, key)
-        _registry_write(_sign_entry(ts_now, genesis_hash, key))
+        _anchor_write(_sign_entry(ts_now, genesis_hash, key))
         return
 
-    # --- Primary deleted but mirror exists ---
+    # --- Deletion detection ---
     if not primary_exists and mirror_exists:
         raise LicenseError(
-            "last_seen.json was deleted while a mirror entry still exists. "
-            "Possible tamper attempt."
+            "last_seen.json was deleted while a mirror entry still exists. Possible tamper."
         )
-
-    # --- Mirror deleted but primary exists ---
     if primary_exists and not mirror_exists:
         raise LicenseError(
-            "Mirror last_seen was deleted while primary entry still exists. "
-            "Possible tamper attempt."
+            "Mirror last_seen was deleted while primary entry still exists. Possible tamper."
         )
 
-    # --- Both exist: validate primary ---
+    # --- Validate both files ---
     ts_primary, prev_hash_primary, entry_hash_primary = _read_entry(last_seen_path, key)
-
-    # --- Validate mirror and cross-check chain hash ---
     ts_mirror, prev_hash_mirror, entry_hash_mirror = _read_entry(mirror_path, key)
 
     if not hmac.compare_digest(entry_hash_primary, entry_hash_mirror):
         raise LicenseError(
-            "Primary and mirror last_seen do not match. "
-            "File swap or tamper attempt detected."
+            "Primary and mirror last_seen do not match. File swap or tamper detected."
         )
 
-    # --- Cross-check registry on Windows ---
-    reg_sig = _registry_read()
-    if reg_sig is not None:
-        expected_reg_sig = _sign_entry(ts_primary, prev_hash_primary, key)
-        if not hmac.compare_digest(reg_sig, expected_reg_sig):
+    # --- Third-anchor cross-check (Windows registry / macOS plist) ---
+    anchor_sig = _anchor_read()
+    if anchor_sig is not None:
+        expected_anchor_sig = _sign_entry(ts_primary, prev_hash_primary, key)
+        if not hmac.compare_digest(anchor_sig, expected_anchor_sig):
             raise LicenseError(
-                "last_seen.json does not match registry record. "
+                "last_seen.json does not match system anchor record. "
                 "File may have been replaced or tampered with."
             )
 
-    # --- Clock rollback check ---
+    # --- Clock rollback ---
     last_seen_dt = _parse_iso(ts_primary)
     if now < last_seen_dt:
         raise LicenseError(
-            f"Clock rollback detected (now={now.isoformat()}, "
-            f"last_seen={last_seen_dt.isoformat()})."
+            f"Clock rollback detected (now={now.isoformat()}, last_seen={last_seen_dt.isoformat()})."
         )
 
-    # --- Write new chained entry ---
+    # --- Write next chained entry ---
     new_sig = _sign_entry(ts_now, entry_hash_primary, key)
     _write_entry(last_seen_path, ts_now, entry_hash_primary, key)
     _write_entry(mirror_path, ts_now, entry_hash_primary, key)
-    _registry_write(new_sig)
+    _anchor_write(new_sig)
 
 
 # ---------------------------------------------------------------------------
@@ -262,9 +294,7 @@ def load_and_verify_license(
     payload = license_obj["payload"]
     signature_b64 = license_obj["signature"]
 
-    payload_bytes = json.dumps(
-        payload, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8")
+    payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     signature = base64.b64decode(signature_b64)
 
     public_key = serialization.load_pem_public_key(public_key_path.read_bytes())
