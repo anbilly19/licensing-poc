@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,18 +38,57 @@ def _parse_iso(ts: str) -> datetime:
     return datetime.fromisoformat(ts).astimezone(timezone.utc)
 
 
-def _check_clock_rollback(now: datetime, last_seen_path: Path) -> None:
+def _last_seen_hmac_key(public_key_path: Path) -> bytes:
+    """Derive a stable HMAC key from the public key bytes.
+    The public key is already on disk and not secret, but it is
+    machine-specific (tied to this deployment) and not easily
+    guessable, making it a good tamper-detection key for the POC.
+    """
+    raw = public_key_path.read_bytes()
+    return hashlib.sha256(raw).digest()
+
+
+def _sign_last_seen(ts: str, key: bytes) -> str:
+    return hmac.new(key, ts.encode(), hashlib.sha256).hexdigest()
+
+
+def _write_last_seen(now: datetime, last_seen_path: Path, key: bytes) -> None:
+    ts = now.isoformat().replace("+00:00", "Z")
+    sig = _sign_last_seen(ts, key)
+    last_seen_path.write_text(json.dumps({"last_seen": ts, "sig": sig}))
+
+
+def _check_clock_rollback(
+    now: datetime, last_seen_path: Path, public_key_path: Path
+) -> None:
+    key = _last_seen_hmac_key(public_key_path)
+
     if last_seen_path.exists():
-        data = json.loads(last_seen_path.read_text())
-        last_seen = _parse_iso(data["last_seen"])
+        try:
+            data = json.loads(last_seen_path.read_text())
+            ts = data["last_seen"]
+            stored_sig = data["sig"]
+        except (KeyError, json.JSONDecodeError):
+            raise LicenseError(
+                "last_seen.json is malformed or missing signature. "
+                "File may have been tampered with."
+            )
+
+        expected_sig = _sign_last_seen(ts, key)
+        if not hmac.compare_digest(stored_sig, expected_sig):
+            raise LicenseError(
+                "last_seen.json signature invalid. "
+                "File has been tampered with."
+            )
+
+        last_seen = _parse_iso(ts)
         if now < last_seen:
             raise LicenseError(
                 f"Clock rollback detected (now={now.isoformat()}, "
                 f"last_seen={last_seen.isoformat()})."
             )
-    last_seen_path.write_text(
-        json.dumps({"last_seen": now.isoformat().replace("+00:00", "Z")})
-    )
+
+    _write_last_seen(now, last_seen_path, key)
 
 
 def load_and_verify_license(
@@ -101,7 +142,7 @@ def load_and_verify_license(
     if now > not_after:
         raise LicenseError(f"License expired at {not_after}.")
 
-    _check_clock_rollback(now, last_seen_path)
+    _check_clock_rollback(now, last_seen_path, public_key_path)
 
     return License(
         license_id=payload["license_id"],
