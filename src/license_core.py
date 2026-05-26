@@ -23,6 +23,7 @@ _REGISTRY_VALUE = "last_seen_sig"
 _MACOS_DEFAULTS_DOMAIN = "com.onemachine.licensepoc"
 _MACOS_DEFAULTS_KEY = "last_seen_sig"
 _XATTR_NAME = "user.onemachine_sig"
+_LINUX_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor"
 
 # Secret salt mixed into HMAC key derivation.
 # An attacker with only public_key.pem cannot derive the correct HMAC key
@@ -170,7 +171,6 @@ def _xattr_write(path: Path, sig: str) -> None:
     try:
         os.setxattr(str(path), _XATTR_NAME, sig.encode("utf-8"))
     except (OSError, AttributeError):
-        # Filesystem doesn't support xattrs — silently skip.
         pass
 
 
@@ -185,13 +185,44 @@ def _xattr_read(path: Path) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Linux dotfile anchor — stored in ~/.config/.onemachine/anchor.
+# Lives outside the working directory and outside the XDG mirror directory,
+# so deleting both last_seen files still leaves this anchor intact.
+# An attacker would need to know to delete three separate locations.
+# ---------------------------------------------------------------------------
+
+def _dotfile_write(sig: str) -> None:
+    if _system() != "Linux":
+        return
+    try:
+        _LINUX_DOTFILE.parent.mkdir(parents=True, exist_ok=True)
+        _LINUX_DOTFILE.write_text(sig)
+    except OSError:
+        pass
+
+
+def _dotfile_read() -> Optional[str]:
+    if _system() != "Linux":
+        return None
+    try:
+        if _LINUX_DOTFILE.exists():
+            return _LINUX_DOTFILE.read_text().strip() or None
+        return None
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Unified third-anchor helpers
-# Windows: registry, macOS: plist, Linux: xattr on primary file
+# Windows: registry
+# macOS:   plist (defaults)
+# Linux:   dotfile (~/.config/.onemachine/anchor) + xattr on primary file
 # ---------------------------------------------------------------------------
 
 def _anchor_write(sig: str, primary_path: Optional[Path] = None) -> None:
     _registry_write(sig)
     _defaults_write(sig)
+    _dotfile_write(sig)
     if primary_path is not None:
         _xattr_write(primary_path, sig)
 
@@ -201,8 +232,13 @@ def _anchor_read(primary_path: Optional[Path] = None) -> Optional[str]:
         return _registry_read()
     if _system() == "Darwin":
         return _defaults_read()
-    if _system() == "Linux" and primary_path is not None:
-        return _xattr_read(primary_path)
+    if _system() == "Linux":
+        # Prefer dotfile (survives file deletion); fall back to xattr.
+        val = _dotfile_read()
+        if val is not None:
+            return val
+        if primary_path is not None:
+            return _xattr_read(primary_path)
     return None
 
 
@@ -282,7 +318,7 @@ def _check_clock_rollback(
             "Primary and mirror last_seen do not match. File swap or tamper detected."
         )
 
-    # --- Third-anchor cross-check (Windows registry / macOS plist / Linux xattr) ---
+    # --- Third-anchor cross-check (Windows registry / macOS plist / Linux dotfile+xattr) ---
     anchor_sig = _anchor_read(primary_path=last_seen_path)
     if anchor_sig is not None:
         expected_anchor_sig = _sign_entry(ts_primary, prev_hash_primary, key)
