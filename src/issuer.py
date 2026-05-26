@@ -81,7 +81,6 @@ def issue_license(
         private_key_path.read_bytes(), password=None
     )
 
-    # Determine license_id: reuse existing id for renewals
     existing = conn.execute(
         "SELECT license_id FROM issued_licenses WHERE machine_fingerprint = ?",
         (machine_fingerprint,),
@@ -110,7 +109,6 @@ def issue_license(
     ).encode("utf-8")
     signature_b64 = base64.b64encode(private_key.sign(payload_bytes)).decode("ascii")
 
-    # Upsert: insert new or update existing seat
     conn.execute(
         """
         INSERT INTO issued_licenses (license_id, machine_fingerprint, issued_at)
@@ -133,6 +131,7 @@ def issue_and_write(
     db_path: Path = DEFAULT_DB_PATH,
     max_seats: int = DEFAULT_MAX_SEATS,
     minutes_valid: int = 60,
+    bundle: bool = False,
 ) -> Path:
     """issue_license + write to disk. Used by the CLI."""
     conn = _init_db(db_path)
@@ -142,8 +141,23 @@ def issue_and_write(
         machine_fingerprint, features, private_key_path, db_path, max_seats, minutes_valid
     )
 
-    filename = Path(f"license_{machine_fingerprint[:8]}.json")
-    filename.write_text(json.dumps(lic, indent=2))
+    # Always write individual license file
+    license_filename = Path(f"license_{machine_fingerprint[:8]}.json")
+    license_filename.write_text(json.dumps(lic, indent=2))
+
+    # Optionally write bundle with public key embedded
+    bundle_filename: Optional[Path] = None
+    if bundle:
+        public_key_path = private_key_path.parent / "public_key.pem"
+        if not public_key_path.exists():
+            print("Warning: public_key.pem not found next to private_key.pem, skipping bundle.")
+        else:
+            bundle_obj = {
+                "public_key": public_key_path.read_text(),
+                "license": lic,
+            }
+            bundle_filename = Path(f"license_bundle_{machine_fingerprint[:8]}.json")
+            bundle_filename.write_text(json.dumps(bundle_obj, indent=2))
 
     seats_used = _count_unique_machines(_init_db(db_path))
     action = "Renewed" if is_renewal else "Issued"
@@ -151,9 +165,14 @@ def issue_and_write(
     print(f"  machine : {machine_fingerprint}")
     print(f"  features: {', '.join(features)}")
     print(f"  valid   : {minutes_valid} minutes")
-    print(f"  file    : {filename}")
     print(f"  seats   : {seats_used}/{max_seats} unique machines")
     if is_renewal:
-        print("  [renewal — existing seat updated, no new seat consumed]")
-    print("Send this file to the client as license.json")
-    return filename
+        print("  [renewal - existing seat updated, no new seat consumed]")
+    if bundle_filename:
+        print(f"  bundle  : {bundle_filename}  <-- send this single file to the client")
+        print(f"  client runs: onemachine-license install {bundle_filename}")
+    else:
+        print(f"  file    : {license_filename}")
+        print("  Send license file + public_key.pem to the client.")
+
+    return bundle_filename or license_filename
