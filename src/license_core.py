@@ -23,6 +23,11 @@ _REGISTRY_VALUE = "last_seen_sig"
 _MACOS_DEFAULTS_DOMAIN = "com.onemachine.licensepoc"
 _MACOS_DEFAULTS_KEY = "last_seen_sig"
 
+# Secret salt mixed into HMAC key derivation.
+# An attacker with only public_key.pem cannot derive the correct HMAC key
+# without also knowing this salt, which is compiled into the binary via Nuitka.
+_HMAC_SALT = b"0m-p0c-s4lt-v1-d3f4ult-ch4ng3-b3f0r3-pr0d"
+
 
 @dataclass
 class License:
@@ -51,8 +56,12 @@ def _parse_iso(ts: str) -> datetime:
 
 
 def _last_seen_hmac_key(public_key_path: Path) -> bytes:
-    """Derive a stable HMAC key from the public key bytes."""
-    return hashlib.sha256(public_key_path.read_bytes()).digest()
+    """Derive a stable HMAC key from the salt + public key bytes.
+
+    The salt prevents an attacker who has public_key.pem (which all clients do)
+    from trivially computing the HMAC key and forging last_seen.json entries.
+    """
+    return hashlib.sha256(_HMAC_SALT + public_key_path.read_bytes()).digest()
 
 
 def _get_mirror_path() -> Path:
