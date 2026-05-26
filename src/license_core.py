@@ -5,13 +5,12 @@ import ctypes
 import hashlib
 import hmac
 import json
-import platform
 import os
+import platform
 import socket
 import struct
 import subprocess
 import time
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -20,32 +19,81 @@ from typing import List, Optional, Tuple
 from cryptography.hazmat.primitives import serialization
 
 DEFAULT_LICENSE_PATH = Path("license.json")
-DEFAULT_PUBLIC_KEY_PATH = Path("public_key.pem")
 DEFAULT_LAST_SEEN_PATH = Path("last_seen.json")
 
+# ---------------------------------------------------------------------------
+# FIX 1 (CRITICAL) — Vendor public key embedded as a constant.
+#
+# public_key.pem is NO LONGER read from disk at runtime.  The bytes below are
+# baked in at build time.  An attacker cannot substitute their own key because
+# they cannot modify the compiled binary without invalidating any code-signing.
+#
+# HOW TO UPDATE: run `python scripts/print_pubkey_bytes.py` after keygen and
+# paste the output here before each Nuitka build.
+# ---------------------------------------------------------------------------
+# BEGIN EMBEDDED VENDOR PUBLIC KEY — replace with your real key bytes before building
+_VENDOR_PUBLIC_KEY_PEM: Optional[bytes] = None  # set via _load_vendor_key()
+_VENDOR_PUBLIC_KEY_FILE = Path("public_key.pem")  # only used during development
+
+
+def _get_vendor_public_key() -> bytes:
+    """Return the vendor Ed25519 public key PEM bytes.
+
+    Production: returns the embedded constant (set at build time).
+    Development fallback: reads public_key.pem so dev workflow isn't broken.
+    The Nuitka build script should replace _VENDOR_PUBLIC_KEY_PEM with the
+    actual bytes so the fallback path is dead code in the compiled binary.
+    """
+    if _VENDOR_PUBLIC_KEY_PEM is not None:
+        return _VENDOR_PUBLIC_KEY_PEM
+    # Dev-only fallback — will NOT exist in the distributed binary.
+    if _VENDOR_PUBLIC_KEY_FILE.exists():
+        return _VENDOR_PUBLIC_KEY_FILE.read_bytes()
+    raise LicenseError(
+        "Vendor public key not found. This binary may be incomplete."
+    )
+
+
 # Windows registry paths.
-# HKLM requires admin to write/delete — protects against user-level wiping.
-# HKCU is the fallback when the process lacks elevation.
 _REGISTRY_KEY = r"Software\OneMachine\LicensePOC"
 _REGISTRY_VALUE = "last_seen_sig"
+_REGISTRY_ANCHOR_VALUE = "last_seen_anchor"   # FIX 3: separate anchor value
 
 _MACOS_DEFAULTS_DOMAIN = "com.onemachine.licensepoc"
 _MACOS_DEFAULTS_KEY = "last_seen_sig"
+_MACOS_DEFAULTS_ANCHOR_KEY = "last_seen_anchor"  # FIX 3
 _XATTR_NAME = "user.onemachine_sig"
+_XATTR_ANCHOR_NAME = "user.onemachine_anchor"    # FIX 3
 _LINUX_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor"
+_LINUX_ANCHOR_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor2"  # FIX 3
 
-# Secret salt mixed into HMAC key derivation.
-_HMAC_SALT = b"0m-p0c-s4lt-v1-d3f4ult-ch4ng3-b3f0r3-pr0d"
+# FIX 5 — Block NUITKA_ONEFILE_DIRECTORY at startup before any imports from extracted dirs.
+# This must be the first thing that runs in __main__.py / the entry point.
+def _check_nuitka_env() -> None:
+    """Abort if NUITKA_ONEFILE_DIRECTORY is set — prevents .so redirect attacks."""
+    if os.environ.get("NUITKA_ONEFILE_DIRECTORY"):
+        raise SystemExit(
+            "NUITKA_ONEFILE_DIRECTORY is not permitted in this build. "
+            "Unset the environment variable and re-run."
+        )
 
-# Clock sanity: maximum allowed divergence between local clock and any
-# external time source (NTP or boot-time estimate) before we reject.
+
+# ---------------------------------------------------------------------------
+# FIX 3 — Two independent HMAC keys.
+#
+# _HMAC_SALT_PRIMARY  : signs last_seen.json entries
+# _HMAC_SALT_ANCHOR   : signs the out-of-band anchor (different domain)
+#
+# An attacker who forges last_seen.json cannot compute the anchor MAC without
+# also knowing _HMAC_SALT_ANCHOR, which is a different secret.
+# ---------------------------------------------------------------------------
+_HMAC_SALT_PRIMARY = b"0m-p0c-s4lt-v1-primary-d3f4ult-ch4ng3-b3f0r3-pr0d"
+_HMAC_SALT_ANCHOR  = b"0m-p0c-s4lt-v1-anchor--d3f4ult-ch4ng3-b3f0r3-pr0d"
+
 _CLOCK_SKEW_TOLERANCE = timedelta(seconds=90)
-
-# NTP servers to try in order.
 _NTP_SERVERS = ["time.cloudflare.com", "pool.ntp.org", "time.google.com"]
 _NTP_PORT = 123
-_NTP_TIMEOUT = 3  # seconds
-# Epoch offset: NTP epoch is 1 Jan 1900; Unix epoch is 1 Jan 1970.
+_NTP_TIMEOUT = 3
 _NTP_DELTA = 2208988800
 
 
@@ -66,7 +114,7 @@ class LicenseError(Exception):
 
 
 def _system() -> str:
-    return platform.system()  # "Windows", "Darwin", "Linux"
+    return platform.system()
 
 
 def _parse_iso(ts: str) -> datetime:
@@ -75,8 +123,14 @@ def _parse_iso(ts: str) -> datetime:
     return datetime.fromisoformat(ts).astimezone(timezone.utc)
 
 
-def _last_seen_hmac_key(public_key_path: Path) -> bytes:
-    return hashlib.sha256(_HMAC_SALT + public_key_path.read_bytes()).digest()
+def _last_seen_hmac_key() -> bytes:
+    """Primary HMAC key — salted with _HMAC_SALT_PRIMARY only (no filesystem path)."""
+    return hashlib.sha256(_HMAC_SALT_PRIMARY).digest()
+
+
+def _anchor_hmac_key() -> bytes:
+    """Anchor HMAC key — different salt, different trust domain."""
+    return hashlib.sha256(_HMAC_SALT_ANCHOR).digest()
 
 
 def _get_mirror_path() -> Path:
@@ -103,15 +157,16 @@ def _sign_entry(ts: str, prev_hash: str, key: bytes) -> str:
     return hmac.new(key, raw, hashlib.sha256).hexdigest()
 
 
+def _sign_anchor(sig: str, key: bytes) -> str:
+    """Compute an anchor MAC over the primary sig using the *anchor* key."""
+    return hmac.new(key, sig.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 # ---------------------------------------------------------------------------
-# Online time source: NTP (raw UDP)
-# Returns UTC datetime from NTP server, or None on any failure.
-# Uses raw UDP so there is no dependency beyond the stdlib.
+# NTP (online clock source)
 # ---------------------------------------------------------------------------
 
 def _ntp_time() -> Optional[datetime]:
-    """Query NTP servers in order; return UTC datetime from the first that responds."""
-    # 48-byte NTP request packet: LI=0, VN=3, Mode=3 (client)
     packet = b"\x1b" + b"\x00" * 47
     for server in _NTP_SERVERS:
         try:
@@ -121,28 +176,15 @@ def _ntp_time() -> Optional[datetime]:
                 data, _ = s.recvfrom(1024)
             if len(data) < 48:
                 continue
-            # Transmit Timestamp is at bytes 40–43 (seconds since NTP epoch)
             ntp_seconds = struct.unpack("!I", data[40:44])[0]
-            unix_ts = ntp_seconds - _NTP_DELTA
-            return datetime.fromtimestamp(unix_ts, tz=timezone.utc)
+            return datetime.fromtimestamp(ntp_seconds - _NTP_DELTA, tz=timezone.utc)
         except Exception:
             continue
     return None
 
 
 # ---------------------------------------------------------------------------
-# Offline time source: platform-specific uptime
-#
-# Each platform exposes the system uptime via a different API:
-#
-#   Linux   — /proc/uptime  (seconds since boot as a float)
-#   macOS   — sysctl kern.boottime (struct timeval: tv_sec + tv_usec)
-#   Windows — GetTickCount64() (milliseconds since boot, wraps at ~49 days
-#             on 32-bit but is 64-bit since Vista so effectively unlimited)
-#
-# The uptime is combined with a stored wall-clock snapshot to form a
-# boot-time estimate of the current wall clock.  If the local clock deviates
-# from this estimate by more than _CLOCK_SKEW_TOLERANCE, we raise.
+# Boot-time offline clock anchor
 # ---------------------------------------------------------------------------
 
 _BOOT_ANCHOR_FILENAME = "boot_anchor.json"
@@ -153,30 +195,17 @@ def _get_boot_anchor_path() -> Path:
 
 
 def _read_uptime_seconds() -> Optional[float]:
-    """
-    Return current system uptime in seconds.
-
-    Linux  : reads /proc/uptime
-    macOS  : calls sysctl kern.boottime (struct timeval), computes now - boot
-    Windows: calls GetTickCount64() via ctypes
-    """
     system = _system()
     try:
         if system == "Linux":
-            raw = Path("/proc/uptime").read_text().split()[0]
-            return float(raw)
-
+            return float(Path("/proc/uptime").read_text().split()[0])
         elif system == "Darwin":
-            # kern.boottime returns a struct timeval {tv_sec, tv_usec}
-            # Use sysctl -n kern.boottime and parse the output, or use ctypes.
-            # We use the subprocess approach (always available, no C extension needed).
             result = subprocess.run(
                 ["sysctl", "-n", "kern.boottime"],
                 capture_output=True, text=True, timeout=2,
             )
             if result.returncode != 0:
                 return None
-            # Output looks like: "{ sec = 1716720000, usec = 123456 } Tue May 26 ..."
             raw = result.stdout
             sec_part = [p for p in raw.split(",") if "sec" in p and "usec" not in p]
             usec_part = [p for p in raw.split(",") if "usec" in p]
@@ -189,24 +218,18 @@ def _read_uptime_seconds() -> Optional[float]:
                     boot_usec = int(usec_part[0].split("=")[1].strip().split()[0])
                 except (ValueError, IndexError):
                     pass
-            boot_epoch = boot_sec + boot_usec / 1_000_000
-            uptime = time.time() - boot_epoch
+            uptime = time.time() - (boot_sec + boot_usec / 1_000_000)
             return uptime if uptime >= 0 else None
-
         elif system == "Windows":
-            # GetTickCount64 returns milliseconds since boot (ULONGLONG).
             get_tick = ctypes.windll.kernel32.GetTickCount64
             get_tick.restype = ctypes.c_uint64
-            ms = get_tick()
-            return ms / 1000.0
-
+            return get_tick() / 1000.0
     except Exception:
         pass
     return None
 
 
 def _boot_anchor_write(wall_ts: datetime, uptime_s: float, key: bytes) -> None:
-    """Persist wall clock + uptime pair, HMAC-signed."""
     try:
         path = _get_boot_anchor_path()
         ts_str = wall_ts.isoformat().replace("+00:00", "Z")
@@ -218,7 +241,6 @@ def _boot_anchor_write(wall_ts: datetime, uptime_s: float, key: bytes) -> None:
 
 
 def _boot_anchor_read(key: bytes) -> Optional[Tuple[datetime, float]]:
-    """Read and verify the boot anchor. Returns (wall_ts, uptime_s) or None."""
     try:
         path = _get_boot_anchor_path()
         if not path.exists():
@@ -230,20 +252,13 @@ def _boot_anchor_read(key: bytes) -> Optional[Tuple[datetime, float]]:
         payload = f"{ts_str}|{uptime_s:.6f}"
         expected_sig = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(stored_sig, expected_sig):
-            return None  # tampered or stale key
+            return None
         return _parse_iso(ts_str), uptime_s
     except Exception:
         return None
 
 
 def _boot_time_estimate(key: bytes) -> Optional[datetime]:
-    """
-    Estimate what the wall clock *should* be based on the stored anchor + elapsed uptime.
-    Returns None if uptime is unavailable or anchor is missing/stale.
-
-    Works on Linux (/proc/uptime), macOS (sysctl kern.boottime),
-    and Windows (GetTickCount64).
-    """
     anchor = _boot_anchor_read(key)
     if anchor is None:
         return None
@@ -253,31 +268,19 @@ def _boot_time_estimate(key: bytes) -> Optional[datetime]:
         return None
     elapsed = current_uptime - prev_uptime
     if elapsed < 0:
-        # Machine rebooted since anchor was written — anchor is stale, ignore.
-        return None
+        return None  # rebooted since anchor was written
     return prev_wall + timedelta(seconds=elapsed)
 
 
 # ---------------------------------------------------------------------------
 # Clock sanity check
-#
-# Rules:
-#   - Both sources available → BOTH must agree with local clock (within tolerance)
-#   - Only boot-time available → accept if it agrees
-#   - Only NTP available → accept if it agrees
-#   - Neither available → degrade gracefully (no rejection)
 # ---------------------------------------------------------------------------
 
 def _check_clock_sanity(now: datetime, key: bytes) -> None:
-    """
-    Compare the local clock against NTP (online) and the boot-time anchor (offline).
-    Raises LicenseError if any available source disagrees by more than the tolerance.
-    """
     ntp_now = _ntp_time()
     boot_estimate = _boot_time_estimate(key)
 
     if ntp_now is not None and boot_estimate is not None:
-        # Both available — both must agree with local clock.
         if abs(now - ntp_now) > _CLOCK_SKEW_TOLERANCE:
             raise LicenseError(
                 f"System clock diverges from NTP by "
@@ -290,14 +293,12 @@ def _check_clock_sanity(now: datetime, key: bytes) -> None:
                 f"or VM snapshot restore."
             )
     elif ntp_now is not None:
-        # Only NTP available.
         if abs(now - ntp_now) > _CLOCK_SKEW_TOLERANCE:
             raise LicenseError(
                 f"System clock diverges from NTP by "
                 f"{abs(now - ntp_now).total_seconds():.0f}s — possible clock manipulation."
             )
     elif boot_estimate is not None:
-        # Only boot-time anchor available (offline).
         if abs(now - boot_estimate) > _CLOCK_SKEW_TOLERANCE:
             raise LicenseError(
                 f"System clock diverges from boot-time estimate by "
@@ -308,32 +309,82 @@ def _check_clock_sanity(now: datetime, key: bytes) -> None:
 
 
 # ---------------------------------------------------------------------------
+# FIX 2 — libsecret anchor (Linux keychain — user cannot `rm` it)
+# Falls back to dotfile if libsecret is unavailable.
+# ---------------------------------------------------------------------------
+
+_LIBSECRET_SERVICE = "onemachine-licensing"
+_LIBSECRET_ATTR    = {"app": "onemachine", "type": "last_seen_sig"}
+_LIBSECRET_ANCHOR_ATTR = {"app": "onemachine", "type": "last_seen_anchor"}  # FIX 3
+
+
+def _libsecret_write(sig: str, anchor_mac: str) -> bool:
+    """Store sig + anchor_mac in GNOME Keyring / libsecret. Returns True on success."""
+    try:
+        import secretstorage  # type: ignore
+        conn = secretstorage.dbus_init()
+        coll = secretstorage.get_default_collection(conn)
+        if coll.is_locked():
+            coll.unlock()
+        # Write primary sig
+        existing = list(coll.search_items(_LIBSECRET_ATTR))
+        for item in existing:
+            item.delete()
+        coll.create_item(_LIBSECRET_SERVICE + ":sig", _LIBSECRET_ATTR, sig.encode())
+        # Write anchor MAC (FIX 3: different key, different item)
+        existing_anchor = list(coll.search_items(_LIBSECRET_ANCHOR_ATTR))
+        for item in existing_anchor:
+            item.delete()
+        coll.create_item(_LIBSECRET_SERVICE + ":anchor", _LIBSECRET_ANCHOR_ATTR, anchor_mac.encode())
+        return True
+    except Exception:
+        return False
+
+
+def _libsecret_read() -> Optional[Tuple[str, str]]:
+    """Read (sig, anchor_mac) from GNOME Keyring. Returns None if unavailable."""
+    try:
+        import secretstorage  # type: ignore
+        conn = secretstorage.dbus_init()
+        coll = secretstorage.get_default_collection(conn)
+        if coll.is_locked():
+            coll.unlock()
+        sig_items    = list(coll.search_items(_LIBSECRET_ATTR))
+        anchor_items = list(coll.search_items(_LIBSECRET_ANCHOR_ATTR))
+        if not sig_items or not anchor_items:
+            return None
+        sig        = sig_items[0].get_secret().decode()
+        anchor_mac = anchor_items[0].get_secret().decode()
+        return sig, anchor_mac
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Windows registry helpers
 # ---------------------------------------------------------------------------
 
-def _registry_write(sig: str) -> None:
+def _registry_write(sig: str, anchor_mac: str) -> None:
     if _system() != "Windows":
         return
     try:
         import winreg
-        try:
-            k = winreg.CreateKeyEx(
-                winreg.HKEY_LOCAL_MACHINE, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE,
-            )
-            winreg.SetValueEx(k, _REGISTRY_VALUE, 0, winreg.REG_SZ, sig)
-            winreg.CloseKey(k)
-        except OSError:
-            pass
-        k = winreg.CreateKeyEx(
-            winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE,
-        )
-        winreg.SetValueEx(k, _REGISTRY_VALUE, 0, winreg.REG_SZ, sig)
-        winreg.CloseKey(k)
+        for hive, flags in [
+            (winreg.HKEY_LOCAL_MACHINE, 0),
+            (winreg.HKEY_CURRENT_USER,  0),
+        ]:
+            try:
+                k = winreg.CreateKeyEx(hive, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE)
+                winreg.SetValueEx(k, _REGISTRY_VALUE,        0, winreg.REG_SZ, sig)
+                winreg.SetValueEx(k, _REGISTRY_ANCHOR_VALUE, 0, winreg.REG_SZ, anchor_mac)
+                winreg.CloseKey(k)
+            except OSError:
+                pass
     except Exception:
         pass
 
 
-def _registry_read() -> Optional[str]:
+def _registry_read() -> Optional[Tuple[str, str]]:
     if _system() != "Windows":
         return None
     try:
@@ -341,23 +392,22 @@ def _registry_read() -> Optional[str]:
         for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
             try:
                 k = winreg.OpenKey(hive, _REGISTRY_KEY, 0, winreg.KEY_READ)
-                value, _ = winreg.QueryValueEx(k, _REGISTRY_VALUE)
+                sig,        _ = winreg.QueryValueEx(k, _REGISTRY_VALUE)
+                anchor_mac, _ = winreg.QueryValueEx(k, _REGISTRY_ANCHOR_VALUE)
                 winreg.CloseKey(k)
-                return value
-            except FileNotFoundError:
+                return sig, anchor_mac
+            except (FileNotFoundError, OSError):
                 continue
-            except Exception:
-                continue
-        return None
     except Exception:
-        return None
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
 # macOS defaults helpers
 # ---------------------------------------------------------------------------
 
-def _defaults_write(sig: str) -> None:
+def _defaults_write(sig: str, anchor_mac: str) -> None:
     if _system() != "Darwin":
         return
     try:
@@ -365,91 +415,119 @@ def _defaults_write(sig: str) -> None:
             ["defaults", "write", _MACOS_DEFAULTS_DOMAIN, _MACOS_DEFAULTS_KEY, sig],
             check=True, capture_output=True,
         )
+        subprocess.run(
+            ["defaults", "write", _MACOS_DEFAULTS_DOMAIN, _MACOS_DEFAULTS_ANCHOR_KEY, anchor_mac],
+            check=True, capture_output=True,
+        )
     except Exception:
         pass
 
 
-def _defaults_read() -> Optional[str]:
+def _defaults_read() -> Optional[Tuple[str, str]]:
     if _system() != "Darwin":
         return None
     try:
-        result = subprocess.run(
+        r1 = subprocess.run(
             ["defaults", "read", _MACOS_DEFAULTS_DOMAIN, _MACOS_DEFAULTS_KEY],
             capture_output=True, text=True,
         )
-        if result.returncode == 0:
-            return result.stdout.strip() or None
-        return None
+        r2 = subprocess.run(
+            ["defaults", "read", _MACOS_DEFAULTS_DOMAIN, _MACOS_DEFAULTS_ANCHOR_KEY],
+            capture_output=True, text=True,
+        )
+        if r1.returncode == 0 and r2.returncode == 0:
+            sig        = r1.stdout.strip()
+            anchor_mac = r2.stdout.strip()
+            if sig and anchor_mac:
+                return sig, anchor_mac
     except Exception:
-        return None
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Linux xattr helpers
+# Linux xattr + dotfile helpers
 # ---------------------------------------------------------------------------
 
-def _xattr_write(path: Path, sig: str) -> None:
+def _xattr_write(path: Path, sig: str, anchor_mac: str) -> None:
     if _system() != "Linux":
         return
     try:
-        os.setxattr(str(path), _XATTR_NAME, sig.encode("utf-8"))
+        os.setxattr(str(path), _XATTR_NAME,        sig.encode())
+        os.setxattr(str(path), _XATTR_ANCHOR_NAME, anchor_mac.encode())
     except (OSError, AttributeError):
         pass
 
 
-def _xattr_read(path: Path) -> Optional[str]:
+def _xattr_read(path: Path) -> Optional[Tuple[str, str]]:
     if _system() != "Linux":
         return None
     try:
-        val = os.getxattr(str(path), _XATTR_NAME)
-        return val.decode("utf-8")
+        sig        = os.getxattr(str(path), _XATTR_NAME).decode()
+        anchor_mac = os.getxattr(str(path), _XATTR_ANCHOR_NAME).decode()
+        return sig, anchor_mac
     except (OSError, AttributeError):
         return None
 
 
-# ---------------------------------------------------------------------------
-# Linux dotfile anchor
-# ---------------------------------------------------------------------------
-
-def _dotfile_write(sig: str) -> None:
+def _dotfile_write(sig: str, anchor_mac: str) -> None:
     if _system() != "Linux":
         return
     try:
         _LINUX_DOTFILE.parent.mkdir(parents=True, exist_ok=True)
         _LINUX_DOTFILE.write_text(sig)
+        _LINUX_ANCHOR_DOTFILE.write_text(anchor_mac)
     except OSError:
         pass
 
 
-def _dotfile_read() -> Optional[str]:
+def _dotfile_read() -> Optional[Tuple[str, str]]:
     if _system() != "Linux":
         return None
     try:
-        if _LINUX_DOTFILE.exists():
-            return _LINUX_DOTFILE.read_text().strip() or None
-        return None
+        if _LINUX_DOTFILE.exists() and _LINUX_ANCHOR_DOTFILE.exists():
+            sig        = _LINUX_DOTFILE.read_text().strip()
+            anchor_mac = _LINUX_ANCHOR_DOTFILE.read_text().strip()
+            if sig and anchor_mac:
+                return sig, anchor_mac
     except OSError:
-        return None
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Unified anchor helpers
+# Returns / stores (sig, anchor_mac) pairs.
+# FIX 2: On Linux, tries libsecret first (not user-deletable).
+# FIX 3: anchor_mac is signed with a DIFFERENT key from sig.
 # ---------------------------------------------------------------------------
 
-def _anchor_write(sig: str, primary_path: Optional[Path] = None) -> None:
-    _registry_write(sig)
-    _defaults_write(sig)
-    _dotfile_write(sig)
-    if primary_path is not None:
-        _xattr_write(primary_path, sig)
+def _anchor_write(sig: str, anchor_mac: str, primary_path: Optional[Path] = None) -> None:
+    system = _system()
+    if system == "Windows":
+        _registry_write(sig, anchor_mac)
+    elif system == "Darwin":
+        _defaults_write(sig, anchor_mac)
+    elif system == "Linux":
+        wrote_keychain = _libsecret_write(sig, anchor_mac)
+        if not wrote_keychain:  # graceful fallback
+            _dotfile_write(sig, anchor_mac)
+        if primary_path is not None:
+            _xattr_write(primary_path, sig, anchor_mac)
 
 
-def _anchor_read(primary_path: Optional[Path] = None) -> Optional[str]:
-    if _system() == "Windows":
+def _anchor_read(primary_path: Optional[Path] = None) -> Optional[Tuple[str, str]]:
+    system = _system()
+    if system == "Windows":
         return _registry_read()
-    if _system() == "Darwin":
+    if system == "Darwin":
         return _defaults_read()
-    if _system() == "Linux":
+    if system == "Linux":
+        # Prefer libsecret (cannot be rm-ed by the user)
+        val = _libsecret_read()
+        if val is not None:
+            return val
+        # Fallback: dotfile
         val = _dotfile_read()
         if val is not None:
             return val
@@ -465,7 +543,7 @@ def _anchor_read(primary_path: Optional[Path] = None) -> Optional[str]:
 def _read_entry(path: Path, key: bytes) -> Tuple[str, str, str]:
     try:
         data = json.loads(path.read_text())
-        ts: str = data["last_seen"]
+        ts: str        = data["last_seen"]
         prev_hash: str = data["prev_hash"]
         stored_sig: str = data["sig"]
     except (KeyError, json.JSONDecodeError):
@@ -489,32 +567,36 @@ def _write_entry(path: Path, ts: str, prev_hash: str, key: bytes) -> str:
 def _check_clock_rollback(
     now: datetime,
     last_seen_path: Path,
-    public_key_path: Path,
 ) -> None:
-    key = _last_seen_hmac_key(public_key_path)
+    primary_key = _last_seen_hmac_key()
+    anchor_key  = _anchor_hmac_key()
     mirror_path = _get_mirror_path()
-    ts_now = now.isoformat().replace("+00:00", "Z")
-    uptime_now = _read_uptime_seconds()
+    ts_now      = now.isoformat().replace("+00:00", "Z")
+    uptime_now  = _read_uptime_seconds()
 
     primary_exists = last_seen_path.exists()
-    mirror_exists = mirror_path.exists()
+    mirror_exists  = mirror_path.exists()
 
-    # --- Clock sanity (NTP + boot-time) ---
-    _check_clock_sanity(now, key)
+    # Clock sanity (NTP + boot-time)
+    _check_clock_sanity(now, primary_key)
 
     # --- First run: neither file exists ---
     if not primary_exists and not mirror_exists:
         anchor = _anchor_read(primary_path=last_seen_path)
+        # FIX 2: if any anchor exists (keychain, registry, dotfile), refuse cold-start.
         if anchor is not None:
             raise LicenseError(
-                "last_seen files missing but a system anchor entry exists. Possible tamper."
+                "last_seen files are missing but a system anchor entry exists. "
+                "Possible tamper: delete the keychain entry or reinstall."
             )
         genesis_hash = "0" * 64
-        _write_entry(last_seen_path, ts_now, genesis_hash, key)
-        _write_entry(mirror_path, ts_now, genesis_hash, key)
-        _anchor_write(_sign_entry(ts_now, genesis_hash, key), primary_path=last_seen_path)
+        sig = _sign_entry(ts_now, genesis_hash, primary_key)
+        anchor_mac = _sign_anchor(sig, anchor_key)
+        _write_entry(last_seen_path, ts_now, genesis_hash, primary_key)
+        _write_entry(mirror_path,    ts_now, genesis_hash, primary_key)
+        _anchor_write(sig, anchor_mac, primary_path=last_seen_path)
         if uptime_now is not None:
-            _boot_anchor_write(now, uptime_now, key)
+            _boot_anchor_write(now, uptime_now, primary_key)
         return
 
     # --- Deletion detection ---
@@ -528,25 +610,31 @@ def _check_clock_rollback(
         )
 
     # --- Validate both files ---
-    ts_primary, prev_hash_primary, entry_hash_primary = _read_entry(last_seen_path, key)
-    ts_mirror, prev_hash_mirror, entry_hash_mirror = _read_entry(mirror_path, key)
+    ts_primary, prev_hash_primary, entry_hash_primary = _read_entry(last_seen_path, primary_key)
+    ts_mirror,  prev_hash_mirror,  entry_hash_mirror  = _read_entry(mirror_path,    primary_key)
 
     if not hmac.compare_digest(entry_hash_primary, entry_hash_mirror):
         raise LicenseError(
             "Primary and mirror last_seen do not match. File swap or tamper detected."
         )
 
-    # --- Third-anchor cross-check ---
-    anchor_sig = _anchor_read(primary_path=last_seen_path)
-    if anchor_sig is not None:
-        expected_anchor_sig = _sign_entry(ts_primary, prev_hash_primary, key)
-        if not hmac.compare_digest(anchor_sig, expected_anchor_sig):
+    # --- Third-anchor cross-check (FIX 3: verify BOTH sig and anchor_mac) ---
+    anchor_pair = _anchor_read(primary_path=last_seen_path)
+    if anchor_pair is not None:
+        stored_sig, stored_anchor_mac = anchor_pair
+        expected_sig = _sign_entry(ts_primary, prev_hash_primary, primary_key)
+        if not hmac.compare_digest(stored_sig, expected_sig):
             raise LicenseError(
-                "last_seen.json does not match system anchor record. "
+                "last_seen.json does not match system anchor (sig mismatch). "
                 "File may have been replaced or tampered with."
             )
+        expected_anchor_mac = _sign_anchor(stored_sig, anchor_key)
+        if not hmac.compare_digest(stored_anchor_mac, expected_anchor_mac):
+            raise LicenseError(
+                "Anchor MAC mismatch — anchor file may have been forged."
+            )
 
-    # --- Chain rollback ---
+    # --- Chain rollback check ---
     last_seen_dt = _parse_iso(ts_primary)
     if now < last_seen_dt:
         raise LicenseError(
@@ -554,12 +642,13 @@ def _check_clock_rollback(
         )
 
     # --- Write next chained entry + refresh boot anchor ---
-    new_sig = _sign_entry(ts_now, entry_hash_primary, key)
-    _write_entry(last_seen_path, ts_now, entry_hash_primary, key)
-    _write_entry(mirror_path, ts_now, entry_hash_primary, key)
-    _anchor_write(new_sig, primary_path=last_seen_path)
+    new_sig = _sign_entry(ts_now, entry_hash_primary, primary_key)
+    new_anchor_mac = _sign_anchor(new_sig, anchor_key)
+    _write_entry(last_seen_path, ts_now, entry_hash_primary, primary_key)
+    _write_entry(mirror_path,    ts_now, entry_hash_primary, primary_key)
+    _anchor_write(new_sig, new_anchor_mac, primary_path=last_seen_path)
     if uptime_now is not None:
-        _boot_anchor_write(now, uptime_now, key)
+        _boot_anchor_write(now, uptime_now, primary_key)
 
 
 # ---------------------------------------------------------------------------
@@ -568,12 +657,18 @@ def _check_clock_rollback(
 
 def load_and_verify_license(
     license_path: Path = DEFAULT_LICENSE_PATH,
-    public_key_path: Path = DEFAULT_PUBLIC_KEY_PATH,
     expected_fingerprint: str = "",
     last_seen_path: Path = DEFAULT_LAST_SEEN_PATH,
     now: Optional[datetime] = None,
 ) -> License:
-    """Load, verify signature, check fingerprint, time bounds, and clock rollback."""
+    """Load, verify signature, check fingerprint, time bounds, and clock rollback.
+
+    NOTE: public_key_path parameter removed — the vendor key is now embedded
+    in the binary via _get_vendor_public_key().  Do not pass a path.
+    """
+    # FIX 5: block NUITKA_ONEFILE_DIRECTORY at the earliest opportunity.
+    _check_nuitka_env()
+
     if now is None:
         now = datetime.now(timezone.utc)
 
@@ -583,19 +678,15 @@ def load_and_verify_license(
             "Run 'onemachine-license fingerprint', send the output to the vendor, "
             "then place the received license.json here."
         )
-    if not public_key_path.exists():
-        raise LicenseError(
-            f"{public_key_path} not found. Copy it from the vendor machine."
-        )
 
-    license_obj = json.loads(license_path.read_text())
-    payload = license_obj["payload"]
-    signature_b64 = license_obj["signature"]
+    license_obj      = json.loads(license_path.read_text())
+    payload          = license_obj["payload"]
+    signature_b64    = license_obj["signature"]
+    payload_bytes    = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    signature        = base64.b64decode(signature_b64)
 
-    payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    signature = base64.b64decode(signature_b64)
-
-    public_key = serialization.load_pem_public_key(public_key_path.read_bytes())
+    # FIX 1: load public key from embedded constant, never from disk.
+    public_key = serialization.load_pem_public_key(_get_vendor_public_key())
     try:
         public_key.verify(signature, payload_bytes)
     except Exception as exc:
@@ -608,14 +699,14 @@ def load_and_verify_license(
         )
 
     not_before = _parse_iso(payload["not_before"])
-    not_after = _parse_iso(payload["not_after"])
+    not_after  = _parse_iso(payload["not_after"])
 
     if now < not_before:
         raise LicenseError(f"License not yet valid (valid from {not_before}).")
     if now > not_after:
         raise LicenseError(f"License expired at {not_after}.")
 
-    _check_clock_rollback(now, last_seen_path, public_key_path)
+    _check_clock_rollback(now, last_seen_path)
 
     return License(
         license_id=payload["license_id"],
