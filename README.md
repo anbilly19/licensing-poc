@@ -23,91 +23,75 @@ Minimal proof-of-concept for **offline, node-locked, time-bound, feature-gated**
 
 ---
 
-## Quick Start (dev)
+## Option A — Standalone executable (no Python needed)
+
+Download the binary for your platform from [Releases](../../releases).
+
+| Platform | Binary |
+|---|---|
+| Windows | `onemachine-license-win.exe` |
+| Linux | `onemachine-license-linux` |
+| macOS | `onemachine-license-mac` |
+
+### Vendor (Laptop A)
+
+**Windows**
+```
+onemachine-license-win.exe keygen
+onemachine-license-win.exe fingerprint
+onemachine-license-win.exe issue --fingerprint <hex> --features rag_chat,transcriber --minutes 60
+```
+
+**Linux/macOS**
+```bash
+chmod +x onemachine-license-linux
+./onemachine-license-linux keygen
+./onemachine-license-linux issue --fingerprint <hex> --features rag_chat,transcriber --minutes 60
+```
+
+### Client (Laptops B & C)
+
+1. Download the binary for your platform
+2. **Windows:** open PowerShell or CMD in the download folder
+   **Linux/macOS:** `chmod +x onemachine-license-linux`
+3. Get your fingerprint and send it to the vendor:
+   ```
+   onemachine-license-win.exe fingerprint
+   ```
+4. Place the two files from the vendor in the **same folder** as the binary:
+   ```
+   onemachine-license-win.exe   <- binary
+   license.json                 <- rename from license_<fp8>.json
+   public_key.pem               <- from vendor
+   ```
+5. Run the demo:
+   ```
+   onemachine-license-win.exe demo
+   ```
+
+---
+
+## Option B — Dev setup with uv
 
 ```bash
 # Install uv: https://docs.astral.sh/uv/
-curl -LsSf https://astral.sh/uv/install.sh | sh
+curl -LsSf https://astral.sh/uv/install.sh | sh   # Linux/macOS
+# Windows: powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-# Install deps
+git clone https://github.com/anbilly19/onemachine-licensing-poc.git
+cd onemachine-licensing-poc
 uv sync
 
-# Run tests
-uv run pytest -v
-```
-
----
-
-## Full Demo Flow (3 Laptops)
-
-### Step 1 — Vendor: generate keypair (once)
-
-```bash
+# Vendor
 uv run onemachine-license keygen
-# Outputs: private_key.pem, public_key.pem
-# Copy public_key.pem to Laptops B and C
-```
+uv run onemachine-license issue --fingerprint <hex> --features rag_chat,transcriber --minutes 60
 
-### Step 2 — Client: get machine fingerprint
-
-```bash
-# On Laptop B or C:
+# Client
 uv run onemachine-license fingerprint
-# Prints 64-char hex, saves fingerprint.txt
-# Send fingerprint.txt (or paste the hex) to the vendor
-```
-
-### Step 3 — Vendor: issue a license
-
-```bash
-# On Laptop A:
-uv run onemachine-license issue \
-  --fingerprint <hex from client> \
-  --features rag_chat,transcriber \
-  --minutes 60
-# Outputs: license_<fp8>.json
-# Send this file to the client as license.json
-```
-
-### Step 4 — Client: run the demo
-
-```bash
-# On Laptop B or C:
-# Place license.json and public_key.pem in the same directory
 uv run onemachine-license demo
-```
 
----
-
-## Standalone Executables (no Python needed)
-
-### Download from GitHub Releases
-
-Go to [Releases](../../releases) and download the binary for your platform:
-
-| Platform | File |
-|---|---|
-| Linux | `onemachine-license-linux` |
-| Windows | `onemachine-license-win.exe` |
-| macOS | `onemachine-license-mac` |
-
-```bash
-# Linux / macOS
-chmod +x onemachine-license-linux
-./onemachine-license-linux fingerprint
-./onemachine-license-linux demo
-
-# Windows
-onemachine-license-win.exe fingerprint
-onemachine-license-win.exe demo
-```
-
-### Build locally
-
-```bash
-uv sync --group dev
-uv run python scripts/build_executables.py
-# Output: dist/onemachine-license
+# Tests
+uv run pytest -v
 ```
 
 ---
@@ -117,19 +101,28 @@ uv run python scripts/build_executables.py
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
-# GitHub Actions builds Linux/Windows/macOS executables
-# and publishes them to the GitHub Release automatically
+# GitHub Actions builds Linux/Windows/macOS executables and publishes the Release
 ```
 
 ---
 
-## Demo points to showcase
+## Demo scenarios to showcase
 
 | Scenario | How to demo |
 |---|---|
-| Node-locking | Copy license from B to C → DENIED (wrong fingerprint) |
+| Node-locking | Copy `license.json` from B to C → DENIED (wrong fingerprint) |
 | Expiry | Issue a 2-min license → wait → re-run demo → EXPIRED |
 | Feature gating | Laptop C gets only `rag_chat` → `transcribe` is DENIED |
 | Seat cap | Try issuing a 3rd license on Laptop A → SEAT CAP error |
 | Offline | Disconnect all network on Laptop B → demo still works |
 | Clock rollback | Roll back system clock → ROLLBACK DETECTED error |
+
+---
+
+## Files the vendor must keep
+
+| File | Purpose | Share? |
+|---|---|---|
+| `private_key.pem` | Signs licenses | ❌ Never |
+| `public_key.pem` | Verifies licenses | ✅ Send to all clients |
+| `seats.db` | Tracks issued seats | ❌ Keep locally |

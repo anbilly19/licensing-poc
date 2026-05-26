@@ -80,34 +80,105 @@ jobs:
           body: |
             ## OneMachine Licensing POC ${{ github.ref_name }}
 
-            ### Vendor setup (Laptop A — run once)
-            ```
+            > **No Python or uv required on client machines.** Download the binary, place two files next to it, run.
+
+            ---
+
+            ## Vendor setup — Laptop A (run once)
+
+            **Linux/macOS**
+            ```bash
+            chmod +x onemachine-license-linux
             ./onemachine-license-linux keygen
-            # Copy public_key.pem to each client
             ```
 
-            ### Client setup (Laptops B & C)
-            1. Download the binary for your platform below
-            2. Make it executable (Linux/Mac): `chmod +x onemachine-license-linux`
-            3. Get your fingerprint:
-               ```
-               ./onemachine-license-linux fingerprint
-               # sends fingerprint.txt to vendor
-               ```
-            4. Receive `license_<fp>.json` from vendor, rename to `license.json`
-            5. Place `public_key.pem` (from vendor) next to the binary
-            6. Run the demo:
-               ```
-               ./onemachine-license-linux demo
-               ```
+            **Windows** (PowerShell or CMD)
+            ```
+            onemachine-license-win.exe keygen
+            ```
 
-            ### Vendor issues a license
+            Outputs `private_key.pem` (keep secret) and `public_key.pem` (send to every client).
+
+            ---
+
+            ## Client setup — Laptops B & C
+
+            ### Step 1 — Download the binary for your platform
+
+            | Platform | File to download |
+            |---|---|
+            | Windows | `onemachine-license-win.exe` |
+            | Linux   | `onemachine-license-linux` |
+            | macOS   | `onemachine-license-mac` |
+
+            ### Step 2 — Get your machine fingerprint
+
+            **Windows** (PowerShell or CMD — no admin needed)
             ```
-            ./onemachine-license-linux issue \\
-              --fingerprint <client_hex> \\
-              --features rag_chat,transcriber \\
-              --minutes 60
+            onemachine-license-win.exe fingerprint
             ```
+
+            **Linux/macOS**
+            ```bash
+            chmod +x onemachine-license-linux
+            ./onemachine-license-linux fingerprint
+            ```
+
+            This prints a 64-char hex and saves `fingerprint.txt`. Send that to the vendor.
+
+            ### Step 3 — Receive two files from the vendor
+
+            Place these in the **same folder** as the executable:
+            - `license.json` (rename from `license_<fp8>.json` the vendor sends)
+            - `public_key.pem` (vendor sends this once)
+
+            Your folder should look like:
+            ```
+            onemachine-license-win.exe   <- the binary
+            license.json                 <- from vendor
+            public_key.pem               <- from vendor
+            ```
+
+            ### Step 4 — Run the demo
+
+            **Windows**
+            ```
+            onemachine-license-win.exe demo
+            ```
+
+            **Linux/macOS**
+            ```bash
+            ./onemachine-license-linux demo
+            ```
+
+            ---
+
+            ## Vendor: issue a license for a client
+
+            **Windows**
+            ```
+            onemachine-license-win.exe issue --fingerprint <64-char hex> --features rag_chat,transcriber --minutes 60
+            ```
+
+            **Linux/macOS**
+            ```bash
+            ./onemachine-license-linux issue --fingerprint <64-char hex> --features rag_chat,transcriber --minutes 60
+            ```
+
+            Outputs `license_<fp8>.json` — rename to `license.json` and send to the client.
+
+            ---
+
+            ## Demo commands (inside the REPL)
+
+            | Command | Feature required |
+            |---|---|
+            | `rag` | `rag_chat` |
+            | `transcribe` | `transcriber` |
+            | `sql` | `nl_sql` |
+            | `reports` | `reports` |
+            | `info` | always available |
+            | `quit` | always available |
           files: |
             release_artifacts/onemachine-license-linux
             release_artifacts/onemachine-license-win.exe
