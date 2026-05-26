@@ -1,6 +1,8 @@
 # OneMachine Licensing POC
 
-Minimal proof-of-concept for **offline, node-locked, time-bound, feature-gated** software licensing.
+Minimal proof-of-concept for **offline/online, node-locked, time-bound, feature-gated**
+software licensing with an optional activation server for seat management and license
+renewal.
 
 ## Architecture
 
@@ -8,18 +10,207 @@ Minimal proof-of-concept for **offline, node-locked, time-bound, feature-gated**
 - **Machine fingerprint** — derived from OS hardware identifiers (see [Fingerprinting](#fingerprinting))
 - **Time bounds** — `not_before` / `not_after` UTC timestamps
 - **Feature flags** — per-license module gating
-- **Seat cap** — SQLite-backed limit on concurrent machines (vendor side)
+- **Seat cap** — SQLite-backed limit, tracked per activation key
 - **Clock rollback detection** — chained `last_seen.json` guard + NTP + boot-time anchor
-- **Fully offline** — client never needs internet after initial setup
+- **Online activation** — client calls `/activate` with an activation key; server signs and returns `license.json`
+- **Heartbeat / renewal** — client calls `/heartbeat` every 7 days; server re-signs if subscription still valid
+- **Fully offline after activation** — client works air-gapped; heartbeat degrades gracefully on network failure
 
 ---
 
 ## Roles
 
-| Role | Machine | Commands |
+| Role | Who | Commands |
 |---|---|---|
-| Vendor | Laptop A | `keygen`, `issue` |
-| Client | Laptop B / C | `fingerprint`, `demo` |
+| Vendor | You (server) | `keygen`, `create-key`, `issue` (dev/manual) |
+| Client | Customer machine | `activate`, `heartbeat`, `demo` |
+
+---
+
+## Local Development Quickstart
+
+The full flow can be tested on a single machine with two terminal windows.
+
+### 1. Install
+
+```bash
+# Install uv: https://docs.astral.sh/uv/
+curl -LsSf https://astral.sh/uv/install.sh | sh   # Linux/macOS
+# Windows: powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+git clone https://github.com/anbilly19/onemachine-licensing-poc.git
+cd onemachine-licensing-poc
+uv sync
+```
+
+Install FastAPI + uvicorn for the activation server:
+
+```bash
+uv pip install fastapi uvicorn
+```
+
+### 2. Generate keypair (vendor)
+
+```bash
+uv run onemachine-license keygen
+# Writes: private_key.pem, public_key.pem
+```
+
+### 3. Start the activation server (Terminal 1)
+
+```bash
+uv run uvicorn src.activation_server:app --reload --port 8000
+# → http://localhost:8000
+# → http://localhost:8000/docs  (Swagger UI)
+```
+
+> **Environment variables** (optional overrides):
+> ```bash
+> export PRIVATE_KEY_PATH=private_key.pem
+> export DB_PATH=seats.db
+> export ADMIN_TOKEN=my-secret-admin-token
+> ```
+
+### 4. Create an activation key for a customer (Terminal 2, vendor)
+
+```bash
+uv run onemachine-license create-key \
+  --activation-key  "DEMO-2026-ABCD-EFGH" \
+  --customer-id     "cust-de-0042" \
+  --customer-name   "Müller GmbH" \
+  --max-seats       2 \
+  --features        "rag_chat,transcriber" \
+  --days            365
+```
+
+This writes the key into `seats.db` on the server.
+
+### 5. Activate a machine (Terminal 2, client)
+
+```bash
+uv run onemachine-license activate \
+  --activation-key "DEMO-2026-ABCD-EFGH"
+# Detects machine fingerprint automatically
+# Calls http://localhost:8000/activate
+# Writes: license.json
+```
+
+### 6. Run the demo app
+
+```bash
+uv run onemachine-license demo
+# Feature-gated REPL — reads license.json and verifies the Ed25519 signature
+```
+
+### 7. Force a heartbeat / renewal
+
+```bash
+uv run onemachine-license heartbeat
+# Calls http://localhost:8000/heartbeat
+# Re-signs license.json with a fresh validity window
+```
+
+### 8. Run the test suite
+
+```bash
+uv run pytest -v
+```
+
+---
+
+## Online Activation Flow (detailed)
+
+```
+Client                        Activation Server               seats.db
+  │                                 │                            │
+  │── POST /activate ──────────────►│                            │
+  │   {activation_key, fingerprint} │                            │
+  │                                 │── lookup activation_key ──►│
+  │                                 │◄─ customer, max_seats ─────│
+  │                                 │── seat count check ────────│
+  │                                 │── sign license (Ed25519)   │
+  │                                 │── upsert issued_licenses ─►│
+  │◄── {license: {payload, sig}} ───│                            │
+  │                                 │                            │
+  │  (7 days later)                 │                            │
+  │── POST /heartbeat ─────────────►│                            │
+  │   {license_id, fingerprint,     │                            │
+  │    activation_key}              │── check key still valid ──►│
+  │                                 │── re-sign                  │
+  │◄── {valid: true, license: ...} ─│                            │
+```
+
+**Revocation:** delete or expire the activation key on the server. The next
+heartbeat returns `{valid: false}`. The client prints a warning; the cached
+license expires naturally at `not_after` — no hard kill.
+
+---
+
+## API Endpoints
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/activate` | None | First-time machine activation |
+| `POST` | `/heartbeat` | None | Periodic license renewal |
+| `POST` | `/admin/create-key` | `Bearer ADMIN_TOKEN` | Create activation key for a customer |
+| `GET` | `/health` | None | Server uptime check |
+| `GET` | `/docs` | None | Swagger UI (dev only) |
+
+### Example: create a key via curl
+
+```bash
+curl -s -X POST http://localhost:8000/admin/create-key \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer change-me-in-production" \
+  -d '{
+    "activation_key": "ACME-2026-XXXX-YYYY",
+    "customer_id":    "cust-001",
+    "customer_name":  "Acme Corp",
+    "max_seats":      3,
+    "features":       ["rag_chat","transcriber"],
+    "days_valid":     365
+  }' | python -m json.tool
+```
+
+### Example: activate via curl (simulates client)
+
+```bash
+FP=$(uv run onemachine-license fingerprint | head -1)
+curl -s -X POST http://localhost:8000/activate \
+  -H "Content-Type: application/json" \
+  -d "{\"activation_key\": \"ACME-2026-XXXX-YYYY\", \"machine_fingerprint\": \"$FP\"}" \
+  | python -m json.tool
+```
+
+---
+
+## CLI Reference
+
+| Command | Role | Description |
+|---|---|---|
+| `keygen` | Vendor | Generate Ed25519 keypair |
+| `create-key` | Vendor | Register an activation key for a customer in `seats.db` |
+| `issue` | Vendor (dev) | Manually sign and write a license file (no server needed) |
+| `fingerprint` | Client | Print + save this machine's fingerprint |
+| `activate` | Client | Activate against the online server, write `license.json` |
+| `heartbeat` | Client | Force a renewal check now |
+| `install` | Client (legacy) | Install a license bundle (extracts `public_key.pem` + `license.json`) |
+| `demo` | Client | Run the feature-gated demo REPL |
+
+---
+
+## Demo Scenarios
+
+| Scenario | How to demo |
+|---|---|
+| **Online activation** | Run steps 3–6 above on two terminals |
+| **Node-locking** | Copy `license.json` to a second machine → DENIED (wrong fingerprint) |
+| **Expiry** | Issue a 2-min license → wait → re-run demo → EXPIRED |
+| **Feature gating** | Create key with only `rag_chat` → `transcribe` is DENIED |
+| **Seat cap** | Activate a 3rd machine with `--max-seats 2` key → SEAT CAP error |
+| **Revocation** | Delete key row from `seats.db` → next heartbeat returns `valid: false` |
+| **Offline mode** | Stop the server → `heartbeat` warns but cached license still works until expiry |
+| **Clock rollback** | Roll back system clock → ROLLBACK DETECTED |
 
 ---
 
@@ -33,75 +224,35 @@ Download the binary for your platform from [Releases](../../releases).
 | Linux | `onemachine-license-linux` |
 | macOS | `onemachine-license-mac` |
 
-### Vendor (Laptop A)
-
-**Windows**
-```
-onemachine-license-win.exe keygen
-onemachine-license-win.exe fingerprint
-onemachine-license-win.exe issue --fingerprint <hex> --features rag_chat,transcriber --minutes 60
-```
-
-**Linux/macOS**
-```bash
-chmod +x onemachine-license-linux
-./onemachine-license-linux keygen
-./onemachine-license-linux issue --fingerprint <hex> --features rag_chat,transcriber --minutes 60
-```
-
 ### Client (Laptops B & C)
 
-1. Download the binary for your platform
-2. **Windows:** open PowerShell or CMD in the download folder
-   **Linux/macOS:** `chmod +x onemachine-license-linux`
-3. Get your fingerprint and send it to the vendor:
+1. Download the binary for your platform.
+2. Run activation (requires internet access to the activation server):
    ```
-   onemachine-license-win.exe fingerprint
+   onemachine-license-win.exe activate --activation-key YOUR-KEY-HERE
    ```
-4. Place the **two files** from the vendor in the same folder as the binary:
-   ```
-   onemachine-license-win.exe   ← binary
-   license.json                 ← rename from license_<fp8>.json
-   ```
-   > **Note:** `public_key.pem` is no longer distributed to clients — it is embedded
-   > inside the binary at build time (see [Security Notes](#security-notes)).
-5. Run the demo:
+3. Run the demo:
    ```
    onemachine-license-win.exe demo
    ```
+
+> The activation server URL is baked into the binary at build time via the
+> `_ACTIVATION_SERVER_URL` constant in `src/activation_client.py`. For dev builds,
+> set `ACTIVATION_SERVER_URL=http://localhost:8000` in the environment.
 
 ---
 
 ## Option B — Dev setup with uv
 
-```bash
-# Install uv: https://docs.astral.sh/uv/
-curl -LsSf https://astral.sh/uv/install.sh | sh   # Linux/macOS
-# Windows: powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-git clone https://github.com/anbilly19/onemachine-licensing-poc.git
-cd onemachine-licensing-poc
-uv sync
-
-# Vendor
-uv run onemachine-license keygen
-uv run onemachine-license issue --fingerprint <hex> --features rag_chat,transcriber --minutes 60
-
-# Client
-uv run onemachine-license fingerprint
-uv run onemachine-license demo
-
-# Tests
-uv run pytest -v
-```
+See [Local Development Quickstart](#local-development-quickstart) above.
 
 ---
 
 ## Release a new version
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 # GitHub Actions builds Linux/Windows/macOS executables and publishes the Release
 ```
 
@@ -122,26 +273,13 @@ All sources are read directly from the OS (sysfs, registry, ioreg) — no libc i
 
 ---
 
-## Demo scenarios to showcase
-
-| Scenario | How to demo |
-|---|---|
-| Node-locking | Copy `license.json` from B to C → DENIED (wrong fingerprint) |
-| Expiry | Issue a 2-min license → wait → re-run demo → EXPIRED |
-| Feature gating | Laptop C gets only `rag_chat` → `transcribe` is DENIED |
-| Seat cap | Try issuing a 3rd license on Laptop A → SEAT CAP error |
-| Offline | Disconnect all network on Laptop B → demo still works |
-| Clock rollback | Roll back system clock → ROLLBACK DETECTED error |
-
----
-
 ## Files the vendor must keep
 
 | File | Purpose | Share? |
 |---|---|---|
 | `private_key.pem` | Signs licenses | ❌ Never |
 | `public_key.pem` | Embedded in binary at build time | ❌ Do not distribute |
-| `seats.db` | Tracks issued seats | ❌ Keep locally |
+| `seats.db` | Tracks issued seats + activation keys | ❌ Keep on server |
 
 > **One key pair for all customers.** Each customer receives a unique `license.json`
 > signed with the vendor private key and locked to their machine fingerprint. The same
@@ -206,6 +344,17 @@ vulnerabilities. All were addressed in this commit:
 | 5 | Medium | `NUITKA_ONEFILE_DIRECTORY` env var allowed redirect of extracted `.so` files, enabling full cryptography layer replacement | `_check_nuitka_env()` aborts immediately if the env var is set |
 | 6 | Medium | HMAC key constants (`_HMAC_SALT`, `_last_seen_hmac_key`) extractable from Nuitka bytecode | Dual-key split reduces blast radius; full mitigation requires a server-side heartbeat or TPM-sealed key (future work) |
 
+#### 7. Online activation + heartbeat — `2f8ae2e`
+
+Added server-side activation flow that directly addresses VULN-6 (HMAC key extraction)
+and adds revocation capability:
+
+- `activation_keys` table in `seats.db` — per-customer seat cap, expiry, and features
+- Seat cap now enforced **per activation key** (not globally)
+- `customer_id` and `activation_key` embedded in every signed license payload
+- `/heartbeat` allows the server to invalidate a license at renewal time
+- Client degrades gracefully on network failure — cached license still works until `not_after`
+
 ### Threat coverage summary
 
 | Attack | Mitigated by |
@@ -220,13 +369,15 @@ vulnerabilities. All were addressed in this commit:
 | Roll back clock while offline | Boot-time uptime anchor |
 | VM snapshot restore with mismatched clock | Boot-time anchor (uptime goes backward → ignored; NTP catches online) |
 | Primary ↔ mirror file swap | Cross-check of chained entry hashes |
+| License used after subscription cancelled | Heartbeat revocation — next renewal returns `valid: false` |
+| Seat count exceeded by concurrent activations | Per-activation-key seat cap in `seats.db` |
 
 ### Remaining limitations (known, accepted for PoC)
 
 - **HMAC key extraction (VULN-6):** Any secret embedded in a client binary can
   eventually be extracted by a sufficiently motivated attacker. The only fully robust
   solution is a **server-side timestamp authority** that issues signed time attestations.
-  This is scoped as future work.
+  The heartbeat endpoint partially addresses this — a revoked machine cannot renew.
 - **Binary protection (open-source constraint):** Nuitka alone is reversible with FLIRT
   signatures. Stronger options (PyArmor + Nuitka, ChaosProtector, VMProtect) exist but
   require commercial or non-open-source tooling, which is out of scope for this PoC.
@@ -234,6 +385,29 @@ vulnerabilities. All were addressed in this commit:
   (headless servers, minimal distros), the anchor falls back to the user-writable dotfile,
   reducing VULN-2 protection to pre-fix level. A root-owned `/etc/onemachine/.anchor`
   written via a setuid helper would close this gap.
+- **Activation server HTTPS:** The server must run behind HTTPS (nginx/caddy) in
+  production. Plaintext HTTP exposes the activation key in transit.
+- **`ADMIN_TOKEN` strength:** Default `change-me-in-production` must be replaced with a
+  strong random secret (`openssl rand -hex 32`) before deployment.
+
+---
+
+## Tauri + React + Python — Integration Notes
+
+The licensing logic is designed to integrate cleanly into a Tauri desktop app:
+
+| POC component | Tauri equivalent |
+|---|---|
+| `license_core.py` | Python sidecar spawned by Tauri via sidecar API |
+| `activation_client.py` | Python sidecar calls `/activate` and `/heartbeat` |
+| `public_key.pem` embedding | Embedded in **Rust binary** via `include_bytes!()` |
+| CLI entry point | Tauri `#[tauri::command]` replaces the CLI |
+| Ed25519 signature verification | Moves to Rust (`ed25519-dalek`) — key never in Python |
+
+The key security improvement over the standalone PoC: signature verification happens
+inside the Rust binary (which is code-signed by the OS), so extracting the embedded
+public key becomes significantly harder. The Python sidecar handles clock chains,
+HMAC, NTP, and anchor writes — but can never forge a license on its own.
 
 ---
 
@@ -259,4 +433,11 @@ python -m nuitka \
   --output-filename=onemachine-license-linux \
   --include-package=src \
   src/cli.py
+```
+
+For the activation server URL, patch `_ACTIVATION_SERVER_URL` in
+`src/activation_client.py` to your production URL before building:
+
+```python
+_ACTIVATION_SERVER_URL: Optional[str] = "https://license.yourcompany.com"
 ```
