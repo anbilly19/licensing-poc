@@ -18,8 +18,12 @@ DEFAULT_LICENSE_PATH = Path("license.json")
 DEFAULT_PUBLIC_KEY_PATH = Path("public_key.pem")
 DEFAULT_LAST_SEEN_PATH = Path("last_seen.json")
 
+# Windows registry paths.
+# HKLM requires admin to write/delete — protects against user-level wiping.
+# HKCU is the fallback when the process lacks elevation.
 _REGISTRY_KEY = r"Software\OneMachine\LicensePOC"
 _REGISTRY_VALUE = "last_seen_sig"
+
 _MACOS_DEFAULTS_DOMAIN = "com.onemachine.licensepoc"
 _MACOS_DEFAULTS_KEY = "last_seen_sig"
 _XATTR_NAME = "user.onemachine_sig"
@@ -75,7 +79,6 @@ def _get_mirror_path() -> Path:
     elif system == "Darwin":
         mirror_dir = Path.home() / "Library" / "Application Support" / "OneMachine"
     else:
-        # Linux / other POSIX
         xdg = os.environ.get("XDG_DATA_HOME", "")
         mirror_dir = (Path(xdg) if xdg else Path.home() / ".local" / "share") / "onemachine"
     mirror_dir.mkdir(parents=True, exist_ok=True)
@@ -97,13 +100,44 @@ def _sign_entry(ts: str, prev_hash: str, key: bytes) -> str:
 # ---------------------------------------------------------------------------
 # Windows registry helpers
 # ---------------------------------------------------------------------------
+# Write strategy: always attempt HKLM first (requires admin / elevated process),
+# then always write HKCU as well so there is always at least one anchor even
+# when running non-elevated.
+#
+# Read strategy: prefer HKLM (cannot be deleted without admin); fall back to
+# HKCU if HKLM key is absent (e.g., first ever run was non-elevated).
+#
+# Attack resistance:
+#   - User-level attacker can delete HKCU but NOT HKLM → HKLM anchor survives.
+#   - Admin-level attacker can delete both → treated as first run only when
+#     both JSON files are also gone, which is the same floor as Linux.
+# ---------------------------------------------------------------------------
 
 def _registry_write(sig: str) -> None:
     if _system() != "Windows":
         return
     try:
         import winreg
-        k = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE)
+        # Attempt HKLM (requires admin / elevated process).
+        try:
+            k = winreg.CreateKeyEx(
+                winreg.HKEY_LOCAL_MACHINE,
+                _REGISTRY_KEY,
+                0,
+                winreg.KEY_SET_VALUE,
+            )
+            winreg.SetValueEx(k, _REGISTRY_VALUE, 0, winreg.REG_SZ, sig)
+            winreg.CloseKey(k)
+        except OSError:
+            # Not elevated — silently skip HKLM.
+            pass
+        # Always write HKCU as well (guaranteed to succeed for current user).
+        k = winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            _REGISTRY_KEY,
+            0,
+            winreg.KEY_SET_VALUE,
+        )
         winreg.SetValueEx(k, _REGISTRY_VALUE, 0, winreg.REG_SZ, sig)
         winreg.CloseKey(k)
     except Exception:
@@ -115,11 +149,17 @@ def _registry_read() -> Optional[str]:
         return None
     try:
         import winreg
-        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_READ)
-        value, _ = winreg.QueryValueEx(k, _REGISTRY_VALUE)
-        winreg.CloseKey(k)
-        return value
-    except FileNotFoundError:
+        # Prefer HKLM — user cannot delete without elevation.
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                k = winreg.OpenKey(hive, _REGISTRY_KEY, 0, winreg.KEY_READ)
+                value, _ = winreg.QueryValueEx(k, _REGISTRY_VALUE)
+                winreg.CloseKey(k)
+                return value
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
         return None
     except Exception:
         return None
@@ -159,10 +199,7 @@ def _defaults_read() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Linux xattr helpers — stored on the primary last_seen.json file itself.
-# xattrs are NOT copied by plain `cp` (requires --preserve=xattr),
-# so a naive file backup+restore drops the xattr and triggers tamper detection.
-# Degrades gracefully if the filesystem does not support xattrs.
+# Linux xattr helpers
 # ---------------------------------------------------------------------------
 
 def _xattr_write(path: Path, sig: str) -> None:
@@ -185,10 +222,7 @@ def _xattr_read(path: Path) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Linux dotfile anchor — stored in ~/.config/.onemachine/anchor.
-# Lives outside the working directory and outside the XDG mirror directory,
-# so deleting both last_seen files still leaves this anchor intact.
-# An attacker would need to know to delete three separate locations.
+# Linux dotfile anchor — ~/.config/.onemachine/anchor
 # ---------------------------------------------------------------------------
 
 def _dotfile_write(sig: str) -> None:
@@ -213,14 +247,14 @@ def _dotfile_read() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Unified third-anchor helpers
-# Windows: registry
+# Unified anchor helpers
+# Windows: HKLM (preferred, admin-protected) + HKCU (fallback)
 # macOS:   plist (defaults)
 # Linux:   dotfile (~/.config/.onemachine/anchor) + xattr on primary file
 # ---------------------------------------------------------------------------
 
 def _anchor_write(sig: str, primary_path: Optional[Path] = None) -> None:
-    _registry_write(sig)
+    _registry_write(sig)   # writes HKLM if elevated, always writes HKCU
     _defaults_write(sig)
     _dotfile_write(sig)
     if primary_path is not None:
@@ -229,11 +263,10 @@ def _anchor_write(sig: str, primary_path: Optional[Path] = None) -> None:
 
 def _anchor_read(primary_path: Optional[Path] = None) -> Optional[str]:
     if _system() == "Windows":
-        return _registry_read()
+        return _registry_read()  # prefers HKLM, falls back to HKCU
     if _system() == "Darwin":
         return _defaults_read()
     if _system() == "Linux":
-        # Prefer dotfile (survives file deletion); fall back to xattr.
         val = _dotfile_read()
         if val is not None:
             return val
@@ -318,7 +351,7 @@ def _check_clock_rollback(
             "Primary and mirror last_seen do not match. File swap or tamper detected."
         )
 
-    # --- Third-anchor cross-check (Windows registry / macOS plist / Linux dotfile+xattr) ---
+    # --- Third-anchor cross-check ---
     anchor_sig = _anchor_read(primary_path=last_seen_path)
     if anchor_sig is not None:
         expected_anchor_sig = _sign_entry(ts_primary, prev_hash_primary, key)
