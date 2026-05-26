@@ -4,7 +4,10 @@ Subcommands
 -----------
   keygen       (Vendor) Generate Ed25519 keypair
   fingerprint  (Client) Print + save machine fingerprint
-  issue        (Vendor) Sign and write a license file (use --bundle for single-file delivery)
+  issue        (Vendor) Sign and write a license file
+  create-key   (Vendor) Register an activation key for a customer in seats.db
+  activate     (Client) Activate this machine against the online server
+  heartbeat    (Client) Force a heartbeat / license renewal check now
   install      (Client) Install a license bundle (extracts public_key.pem + license.json)
   demo         (Client) Run the feature-gated demo REPL
 """
@@ -43,6 +46,44 @@ def cmd_issue(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_create_key(args: argparse.Namespace) -> None:
+    from src.issuer import create_activation_key
+    features = [f.strip() for f in args.features.split(",") if f.strip()]
+    create_activation_key(
+        activation_key=args.activation_key,
+        customer_id=args.customer_id,
+        customer_name=args.customer_name,
+        max_seats=args.max_seats,
+        features=features,
+        days_valid=args.days,
+        db_path=Path(args.db) if args.db else Path("seats.db"),
+    )
+
+
+def cmd_activate(args: argparse.Namespace) -> None:
+    from src.fingerprint import get_machine_fingerprint
+    from src.activation_client import activate
+    fp = get_machine_fingerprint()
+    activate(
+        activation_key=args.activation_key,
+        machine_fingerprint=fp,
+        license_path=Path(args.license_out),
+    )
+
+
+def cmd_heartbeat(args: argparse.Namespace) -> None:
+    from src.fingerprint import get_machine_fingerprint
+    from src.activation_client import heartbeat
+    fp = get_machine_fingerprint()
+    refreshed = heartbeat(
+        license_path=Path(args.license),
+        machine_fingerprint=fp,
+        force=True,
+    )
+    if not refreshed:
+        print("Heartbeat: no renewal was performed (server returned not-valid or network error).")
+
+
 def cmd_install(args: argparse.Namespace) -> None:
     """Extract public_key.pem + license.json from a bundle file."""
     import json
@@ -65,10 +106,13 @@ def cmd_install(args: argparse.Namespace) -> None:
     fp = license_obj.get("payload", {}).get("machine_fingerprint", "unknown")[:8]
     not_after = license_obj.get("payload", {}).get("not_after", "unknown")
     features = license_obj.get("payload", {}).get("features", [])
+    customer = license_obj.get("payload", {}).get("customer", "unknown")
+    customer_id = license_obj.get("payload", {}).get("customer_id", "")
 
     print("Bundle installed successfully.")
     print(f"  public_key.pem  -> written")
     print(f"  license.json    -> written")
+    print(f"  customer        : {customer} ({customer_id})")
     print(f"  machine         : {fp}...")
     print(f"  valid until     : {not_after}")
     print(f"  features        : {', '.join(features)}")
@@ -94,36 +138,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="(Client) Print machine fingerprint and save to fingerprint.txt",
     )
 
-    p_issue = sub.add_parser("issue", help="(Vendor) Issue a signed license")
-    p_issue.add_argument(
-        "--fingerprint", required=True, metavar="HEX",
-        help="Machine fingerprint from the client (64-char hex)",
-    )
-    p_issue.add_argument(
-        "--features", default="rag_chat,transcriber", metavar="FEAT1,FEAT2",
-        help="Comma-separated feature list (default: rag_chat,transcriber)",
-    )
-    p_issue.add_argument(
-        "--minutes", type=int, default=60, metavar="N",
-        help="License validity in minutes (default: 60)",
-    )
-    p_issue.add_argument(
-        "--max-seats", type=int, default=2, metavar="N",
-        help="Maximum number of unique machines allowed (default: 2)",
-    )
-    p_issue.add_argument(
-        "--bundle", action="store_true", default=False,
-        help="Also write a license_bundle_<fp8>.json with public_key embedded",
-    )
+    # --- issue (vendor, manual/dev) ---
+    p_issue = sub.add_parser("issue", help="(Vendor) Issue a signed license directly")
+    p_issue.add_argument("--fingerprint", required=True, metavar="HEX")
+    p_issue.add_argument("--features", default="rag_chat,transcriber", metavar="FEAT1,FEAT2")
+    p_issue.add_argument("--minutes", type=int, default=60, metavar="N")
+    p_issue.add_argument("--max-seats", type=int, default=2, metavar="N")
+    p_issue.add_argument("--bundle", action="store_true", default=False)
 
+    # --- create-key (vendor) ---
+    p_ck = sub.add_parser(
+        "create-key",
+        help="(Vendor) Register an activation key for a customer in seats.db",
+    )
+    p_ck.add_argument("--activation-key",  required=True, metavar="KEY",
+                      help="e.g. MULL-2024-ABCD-EFGH")
+    p_ck.add_argument("--customer-id",     required=True, metavar="ID",
+                      help="e.g. cust-de-0042")
+    p_ck.add_argument("--customer-name",   required=True, metavar="NAME",
+                      help="e.g. 'Müller GmbH'")
+    p_ck.add_argument("--max-seats",       type=int, default=2, metavar="N")
+    p_ck.add_argument("--features",        default="rag_chat,transcriber", metavar="FEAT1,FEAT2")
+    p_ck.add_argument("--days",            type=int, default=365, metavar="N",
+                      help="License validity in days (default: 365)")
+    p_ck.add_argument("--db",              default=None, metavar="PATH",
+                      help="Path to seats.db (default: seats.db)")
+
+    # --- activate (client) ---
+    p_act = sub.add_parser(
+        "activate",
+        help="(Client) Activate this machine against the online activation server",
+    )
+    p_act.add_argument("--activation-key", required=True, metavar="KEY",
+                       help="Activation key provided by your vendor")
+    p_act.add_argument("--license-out",    default="license.json", metavar="PATH",
+                       help="Where to write the license file (default: license.json)")
+
+    # --- heartbeat (client) ---
+    p_hb = sub.add_parser(
+        "heartbeat",
+        help="(Client) Force a heartbeat / license renewal check now",
+    )
+    p_hb.add_argument("--license", default="license.json", metavar="PATH")
+
+    # --- install (dev/legacy) ---
     p_install = sub.add_parser(
         "install",
-        help="(Client) Install a license bundle — extracts public_key.pem + license.json",
+        help="(Dev) Install a license bundle — extracts public_key.pem + license.json",
     )
-    p_install.add_argument(
-        "bundle_file", metavar="BUNDLE_FILE",
-        help="Path to license_bundle_<fp8>.json received from vendor",
-    )
+    p_install.add_argument("bundle_file", metavar="BUNDLE_FILE")
 
     sub.add_parser("demo", help="(Client) Run feature-gated demo REPL")
 
@@ -134,11 +197,14 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     dispatch = {
-        "keygen": cmd_keygen,
+        "keygen":      cmd_keygen,
         "fingerprint": cmd_fingerprint,
-        "issue": cmd_issue,
-        "install": cmd_install,
-        "demo": cmd_demo,
+        "issue":       cmd_issue,
+        "create-key":  cmd_create_key,
+        "activate":    cmd_activate,
+        "heartbeat":   cmd_heartbeat,
+        "install":     cmd_install,
+        "demo":        cmd_demo,
     }
     dispatch[args.command](args)
 
