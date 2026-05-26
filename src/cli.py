@@ -10,18 +10,18 @@ Subcommands
 from __future__ import annotations
 
 import argparse
-import sys
+from pathlib import Path
 
 
 def cmd_keygen(_args: argparse.Namespace) -> None:
-    from src.keygen import main as _keygen
-    _keygen()
+    from src.keygen import generate_keypair
+    generate_keypair(Path("private_key.pem"), Path("public_key.pem"))
+    print("Keys written: private_key.pem, public_key.pem")
+    print("Copy public_key.pem to each client machine.")
 
 
 def cmd_fingerprint(_args: argparse.Namespace) -> None:
     from src.fingerprint import get_machine_fingerprint
-    from pathlib import Path
-
     fp = get_machine_fingerprint()
     print(fp)
     Path("fingerprint.txt").write_text(fp)
@@ -29,12 +29,13 @@ def cmd_fingerprint(_args: argparse.Namespace) -> None:
 
 
 def cmd_issue(args: argparse.Namespace) -> None:
-    from src.issuer import issue_license
-
+    from src.issuer import issue_and_write
     features = [f.strip() for f in args.features.split(",") if f.strip()]
-    issue_license(
+    issue_and_write(
         machine_fingerprint=args.fingerprint,
         features=features,
+        private_key_path=Path("private_key.pem"),
+        db_path=Path("seats.db"),
         minutes_valid=args.minutes,
     )
 
@@ -52,38 +53,26 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
 
-    # keygen
     sub.add_parser("keygen", help="(Vendor) Generate Ed25519 keypair")
-
-    # fingerprint
     sub.add_parser(
         "fingerprint",
         help="(Client) Print machine fingerprint and save to fingerprint.txt",
     )
 
-    # issue
     p_issue = sub.add_parser("issue", help="(Vendor) Issue a signed license")
     p_issue.add_argument(
-        "--fingerprint",
-        required=True,
-        metavar="HEX",
+        "--fingerprint", required=True, metavar="HEX",
         help="Machine fingerprint from the client (64-char hex)",
     )
     p_issue.add_argument(
-        "--features",
-        default="rag_chat,transcriber",
-        metavar="FEAT1,FEAT2",
+        "--features", default="rag_chat,transcriber", metavar="FEAT1,FEAT2",
         help="Comma-separated feature list (default: rag_chat,transcriber)",
     )
     p_issue.add_argument(
-        "--minutes",
-        type=int,
-        default=60,
-        metavar="N",
+        "--minutes", type=int, default=60, metavar="N",
         help="License validity in minutes (default: 60)",
     )
 
-    # demo
     sub.add_parser("demo", help="(Client) Run feature-gated demo REPL")
 
     return parser
@@ -92,7 +81,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-
     dispatch = {
         "keygen": cmd_keygen,
         "fingerprint": cmd_fingerprint,
