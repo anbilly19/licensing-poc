@@ -4,6 +4,8 @@ import base64
 import hashlib
 import hmac
 import json
+import platform
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +16,9 @@ from cryptography.hazmat.primitives import serialization
 DEFAULT_LICENSE_PATH = Path("license.json")
 DEFAULT_PUBLIC_KEY_PATH = Path("public_key.pem")
 DEFAULT_LAST_SEEN_PATH = Path("last_seen.json")
+
+_REGISTRY_KEY = r"Software\OneMachine\LicensePOC"
+_REGISTRY_VALUE = "last_seen_sig"
 
 
 @dataclass
@@ -32,6 +37,10 @@ class LicenseError(Exception):
     pass
 
 
+def _is_windows() -> bool:
+    return platform.system() == "Windows"
+
+
 def _parse_iso(ts: str) -> datetime:
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
@@ -39,57 +48,117 @@ def _parse_iso(ts: str) -> datetime:
 
 
 def _last_seen_hmac_key(public_key_path: Path) -> bytes:
-    """Derive a stable HMAC key from the public key bytes.
-    The public key is already on disk and not secret, but it is
-    machine-specific (tied to this deployment) and not easily
-    guessable, making it a good tamper-detection key for the POC.
-    """
-    raw = public_key_path.read_bytes()
-    return hashlib.sha256(raw).digest()
+    """Derive a stable HMAC key from the public key bytes."""
+    return hashlib.sha256(public_key_path.read_bytes()).digest()
 
 
 def _sign_last_seen(ts: str, key: bytes) -> str:
     return hmac.new(key, ts.encode(), hashlib.sha256).hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# Windows registry helpers (no-op on non-Windows)
+# ---------------------------------------------------------------------------
+
+def _registry_write(sig: str) -> None:
+    """Write sig to HKCU registry. Silently skipped on non-Windows."""
+    if not _is_windows():
+        return
+    try:
+        import winreg
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE
+        )
+        winreg.SetValueEx(key, _REGISTRY_VALUE, 0, winreg.REG_SZ, sig)
+        winreg.CloseKey(key)
+    except Exception:
+        pass  # Registry unavailable — degrade gracefully
+
+
+def _registry_read() -> Optional[str]:
+    """Read sig from HKCU registry. Returns None if not found or non-Windows."""
+    if not _is_windows():
+        return None
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_READ
+        )
+        value, _ = winreg.QueryValueEx(key, _REGISTRY_VALUE)
+        winreg.CloseKey(key)
+        return value
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# last_seen write / check
+# ---------------------------------------------------------------------------
+
 def _write_last_seen(now: datetime, last_seen_path: Path, key: bytes) -> None:
     ts = now.isoformat().replace("+00:00", "Z")
     sig = _sign_last_seen(ts, key)
     last_seen_path.write_text(json.dumps({"last_seen": ts, "sig": sig}))
+    _registry_write(sig)  # mirror sig to registry on Windows
 
 
 def _check_clock_rollback(
     now: datetime, last_seen_path: Path, public_key_path: Path
 ) -> None:
     key = _last_seen_hmac_key(public_key_path)
+    reg_sig = _registry_read()  # None on Linux/macOS or if key absent
 
-    if last_seen_path.exists():
-        try:
-            data = json.loads(last_seen_path.read_text())
-            ts = data["last_seen"]
-            stored_sig = data["sig"]
-        except (KeyError, json.JSONDecodeError):
+    if not last_seen_path.exists():
+        # File missing — check registry to detect deliberate deletion
+        if reg_sig is not None:
             raise LicenseError(
-                "last_seen.json is malformed or missing signature. "
-                "File may have been tampered with."
+                "last_seen.json was deleted while a registry entry still exists. "
+                "Possible tamper attempt."
             )
+        # First run: no file, no registry entry — allow and initialise
+        _write_last_seen(now, last_seen_path, key)
+        return
 
-        expected_sig = _sign_last_seen(ts, key)
-        if not hmac.compare_digest(stored_sig, expected_sig):
-            raise LicenseError(
-                "last_seen.json signature invalid. "
-                "File has been tampered with."
-            )
+    # File exists — validate its contents
+    try:
+        data = json.loads(last_seen_path.read_text())
+        ts = data["last_seen"]
+        stored_sig = data["sig"]
+    except (KeyError, json.JSONDecodeError):
+        raise LicenseError(
+            "last_seen.json is malformed or missing signature. "
+            "File may have been tampered with."
+        )
 
-        last_seen = _parse_iso(ts)
-        if now < last_seen:
-            raise LicenseError(
-                f"Clock rollback detected (now={now.isoformat()}, "
-                f"last_seen={last_seen.isoformat()})."
-            )
+    expected_sig = _sign_last_seen(ts, key)
+    if not hmac.compare_digest(stored_sig, expected_sig):
+        raise LicenseError(
+            "last_seen.json signature invalid. "
+            "File has been tampered with."
+        )
+
+    # Cross-check file sig against registry sig on Windows
+    if reg_sig is not None and not hmac.compare_digest(stored_sig, reg_sig):
+        raise LicenseError(
+            "last_seen.json does not match registry record. "
+            "File may have been replaced or tampered with."
+        )
+
+    last_seen = _parse_iso(ts)
+    if now < last_seen:
+        raise LicenseError(
+            f"Clock rollback detected (now={now.isoformat()}, "
+            f"last_seen={last_seen.isoformat()})."
+        )
 
     _write_last_seen(now, last_seen_path, key)
 
+
+# ---------------------------------------------------------------------------
+# Main public API
+# ---------------------------------------------------------------------------
 
 def load_and_verify_license(
     license_path: Path = DEFAULT_LICENSE_PATH,
