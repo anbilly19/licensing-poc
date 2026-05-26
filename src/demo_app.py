@@ -2,11 +2,51 @@ from pathlib import Path
 from src.fingerprint import get_machine_fingerprint
 from src.license_core import (
     load_and_verify_license,
+    License,
     LicenseError,
     DEFAULT_LICENSE_PATH,
     DEFAULT_PUBLIC_KEY_PATH,
     DEFAULT_LAST_SEEN_PATH,
 )
+
+
+class FeatureNotEnabledError(Exception):
+    """Raised when a feature is not enabled in the license."""
+
+
+def _require_feature(lic: License, feature: str) -> None:
+    if feature not in lic.features:
+        raise FeatureNotEnabledError(
+            f"Feature '{feature}' is not enabled in your license."
+        )
+
+
+def run_rag(lic: License) -> str:
+    _require_feature(lic, "rag_chat")
+    return "[RAG] Query executed."
+
+
+def run_transcriber(lic: License) -> str:
+    _require_feature(lic, "transcriber")
+    return "[Transcriber] Audio transcribed."
+
+
+def run_nl_sql(lic: License) -> str:
+    _require_feature(lic, "nl_sql")
+    return "[NL-SQL] Query generated."
+
+
+def run_reports(lic: License) -> str:
+    _require_feature(lic, "reports")
+    return "[Reports] Report generated."
+
+
+_COMMANDS = {
+    "rag":        (run_rag,         "rag_chat"),
+    "transcribe": (run_transcriber, "transcriber"),
+    "sql":        (run_nl_sql,      "nl_sql"),
+    "reports":    (run_reports,     "reports"),
+}
 
 
 def main() -> None:
@@ -33,14 +73,7 @@ def main() -> None:
     print(f"  Features   : {', '.join(lic.features)}")
     print("=" * 50)
     print()
-
-    commands = {
-        "rag":       ("rag_chat",    "[RAG] Running a semantic search query... done."),
-        "transcribe":("transcriber", "[Transcriber] Transcribing audio... done."),
-        "summarize": ("summarizer",  "[Summarizer] Summarizing document... done."),
-    }
-
-    print("Commands: rag | transcribe | summarize | info | quit")
+    print("Commands: rag | transcribe | sql | reports | info | quit")
     print()
 
     while True:
@@ -56,16 +89,16 @@ def main() -> None:
         elif cmd == "info":
             print(f"  License : {lic.license_id}")
             print(f"  Features: {', '.join(lic.features)}")
-        elif cmd in commands:
-            feature_key, success_msg = commands[cmd]
-            if feature_key in lic.features:
-                print(success_msg)
-            else:
-                print(f"[DENIED] Feature '{feature_key}' is not enabled in your license.")
+        elif cmd in _COMMANDS:
+            fn, _ = _COMMANDS[cmd]
+            try:
+                print(fn(lic))
+            except FeatureNotEnabledError as exc:
+                print(f"[DENIED] {exc}")
         elif cmd == "":
             continue
         else:
-            print(f"Unknown command '{cmd}'. Try: rag | transcribe | summarize | info | quit")
+            print(f"Unknown command '{cmd}'. Try: rag | transcribe | sql | reports | info | quit")
 
 
 if __name__ == "__main__":
