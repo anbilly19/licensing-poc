@@ -5,7 +5,6 @@ from src.license_core import (
     License,
     LicenseError,
     DEFAULT_LICENSE_PATH,
-    DEFAULT_PUBLIC_KEY_PATH,
     DEFAULT_LAST_SEEN_PATH,
 )
 
@@ -55,7 +54,6 @@ def main() -> None:
     try:
         lic = load_and_verify_license(
             license_path=DEFAULT_LICENSE_PATH,
-            public_key_path=DEFAULT_PUBLIC_KEY_PATH,
             expected_fingerprint=fp,
             last_seen_path=DEFAULT_LAST_SEEN_PATH,
         )
@@ -69,37 +67,26 @@ def main() -> None:
     print("=" * 50)
     print(f"  License ID : {lic.license_id}")
     print(f"  Customer   : {lic.customer}")
-    print(f"  Valid until: {lic.not_after.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"  Valid until: {lic.not_after.date()}")
     print(f"  Features   : {', '.join(lic.features)}")
     print("=" * 50)
     print()
-    print("Commands: rag | transcribe | sql | reports | info | quit")
-    print()
 
+    import sys
     while True:
+        print("Commands: rag | transcribe | sql | reports | quit")
         try:
-            cmd = input("onemachine> ").strip().lower()
+            cmd = input("> ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye.")
             break
-
-        if cmd == "quit":
-            print("Goodbye.")
+        if cmd in ("quit", "q", "exit"):
             break
-        elif cmd == "info":
-            print(f"  License : {lic.license_id}")
-            print(f"  Features: {', '.join(lic.features)}")
-        elif cmd in _COMMANDS:
-            fn, _ = _COMMANDS[cmd]
-            try:
-                print(fn(lic))
-            except FeatureNotEnabledError as exc:
-                print(f"[DENIED] {exc}")
-        elif cmd == "":
+        if cmd not in _COMMANDS:
+            print(f"Unknown command: {cmd}")
             continue
-        else:
-            print(f"Unknown command '{cmd}'. Try: rag | transcribe | sql | reports | info | quit")
-
-
-if __name__ == "__main__":
-    main()
+        fn, _ = _COMMANDS[cmd]
+        try:
+            result = fn(lic)
+            print(result)
+        except FeatureNotEnabledError as exc:
+            print(f"[FEATURE ERROR] {exc}")
