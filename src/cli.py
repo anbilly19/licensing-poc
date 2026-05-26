@@ -55,7 +55,7 @@ def cmd_create_key(args: argparse.Namespace) -> None:
         customer_name=args.customer_name,
         max_seats=args.max_seats,
         features=features,
-        days_valid=args.days,
+        minutes_valid=args.minutes,
         db_path=Path(args.db) if args.db else Path("seats.db"),
     )
 
@@ -142,7 +142,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_issue = sub.add_parser("issue", help="(Vendor) Issue a signed license directly")
     p_issue.add_argument("--fingerprint", required=True, metavar="HEX")
     p_issue.add_argument("--features", default="rag_chat,transcriber", metavar="FEAT1,FEAT2")
-    p_issue.add_argument("--minutes", type=int, default=60, metavar="N")
+    p_issue.add_argument("--minutes", type=float, default=60.0, metavar="N",
+                         help="License validity in minutes; floats allowed e.g. 0.5 = 30 seconds (default: 60)")
     p_issue.add_argument("--max-seats", type=int, default=2, metavar="N")
     p_issue.add_argument("--bundle", action="store_true", default=False)
 
@@ -159,8 +160,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="e.g. 'Müller GmbH'")
     p_ck.add_argument("--max-seats",       type=int, default=2, metavar="N")
     p_ck.add_argument("--features",        default="rag_chat,transcriber", metavar="FEAT1,FEAT2")
-    p_ck.add_argument("--days",            type=int, default=365, metavar="N",
-                      help="License validity in days (default: 365)")
+    p_ck.add_argument("--minutes",         type=float, default=525600.0, metavar="N",
+                      help="License validity in minutes; floats allowed e.g. 2.0 = 2 minutes (default: 525600 = 365 days)")
     p_ck.add_argument("--db",              default=None, metavar="PATH",
                       help="Path to seats.db (default: seats.db)")
 

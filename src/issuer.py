@@ -38,14 +38,14 @@ def _init_db(db_path: Path) -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS activation_keys (
-            activation_key  TEXT PRIMARY KEY,
-            customer_id     TEXT NOT NULL,
-            customer_name   TEXT NOT NULL,
-            max_seats       INTEGER NOT NULL DEFAULT 2,
-            features        TEXT NOT NULL DEFAULT 'rag_chat',
-            days_valid      INTEGER NOT NULL DEFAULT 365,
-            created_at      TEXT NOT NULL,
-            expires_at      TEXT
+            activation_key   TEXT PRIMARY KEY,
+            customer_id      TEXT NOT NULL,
+            customer_name    TEXT NOT NULL,
+            max_seats        INTEGER NOT NULL DEFAULT 2,
+            features         TEXT NOT NULL DEFAULT 'rag_chat',
+            minutes_valid    REAL NOT NULL DEFAULT 525600,
+            created_at       TEXT NOT NULL,
+            expires_at       TEXT
         )
         """
     )
@@ -82,7 +82,7 @@ def create_activation_key(
     customer_name: str,
     max_seats: int = 2,
     features: List[str] = None,
-    days_valid: int = 365,
+    minutes_valid: float = 525600.0,  # 365 days default
     db_path: Path = DEFAULT_DB_PATH,
     now: Optional[datetime] = None,
 ) -> None:
@@ -92,18 +92,18 @@ def create_activation_key(
     if features is None:
         features = ["rag_chat"]
     conn = _init_db(db_path)
-    expires_at = (now + timedelta(days=days_valid)).isoformat().replace("+00:00", "Z")
+    expires_at = (now + timedelta(minutes=minutes_valid)).isoformat().replace("+00:00", "Z")
     conn.execute(
         """
         INSERT INTO activation_keys
-            (activation_key, customer_id, customer_name, max_seats, features, days_valid, created_at, expires_at)
+            (activation_key, customer_id, customer_name, max_seats, features, minutes_valid, created_at, expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(activation_key) DO UPDATE SET
-            customer_name = excluded.customer_name,
-            max_seats     = excluded.max_seats,
-            features      = excluded.features,
-            days_valid    = excluded.days_valid,
-            expires_at    = excluded.expires_at
+            customer_name  = excluded.customer_name,
+            max_seats      = excluded.max_seats,
+            features       = excluded.features,
+            minutes_valid  = excluded.minutes_valid,
+            expires_at     = excluded.expires_at
         """,
         (
             activation_key,
@@ -111,16 +111,26 @@ def create_activation_key(
             customer_name,
             max_seats,
             json.dumps(features),
-            days_valid,
+            minutes_valid,
             now.isoformat().replace("+00:00", "Z"),
             expires_at,
         ),
     )
     conn.commit()
+
+    # Human-readable validity summary
+    if minutes_valid < 60:
+        validity_str = f"{minutes_valid:.1f} minutes"
+    elif minutes_valid < 1440:
+        validity_str = f"{minutes_valid / 60:.2f} hours"
+    else:
+        validity_str = f"{minutes_valid / 1440:.1f} days"
+
     print(f"Activation key created: {activation_key}")
     print(f"  customer : {customer_name} ({customer_id})")
     print(f"  seats    : {max_seats}")
     print(f"  features : {', '.join(features)}")
+    print(f"  valid    : {validity_str}")
     print(f"  expires  : {expires_at}")
 
 
@@ -130,7 +140,7 @@ def issue_license(
     private_key_path: Path = DEFAULT_PRIVATE_KEY_PATH,
     db_path: Path = DEFAULT_DB_PATH,
     max_seats: int = DEFAULT_MAX_SEATS,
-    minutes_valid: int = 60,
+    minutes_valid: float = 60.0,
     now: Optional[datetime] = None,
     customer: str = "DemoCorp",
     customer_id: str = "cust-0000",
@@ -226,14 +236,14 @@ def issue_license_for_activation(
 
     # Look up the activation key
     row = conn.execute(
-        "SELECT customer_id, customer_name, max_seats, features, days_valid, expires_at "
+        "SELECT customer_id, customer_name, max_seats, features, minutes_valid, expires_at "
         "FROM activation_keys WHERE activation_key = ?",
         (activation_key,),
     ).fetchone()
     if row is None:
         raise InvalidActivationKeyError(f"Activation key '{activation_key}' not found.")
 
-    customer_id, customer_name, max_seats, features_json, days_valid, expires_at = row
+    customer_id, customer_name, max_seats, features_json, minutes_valid, expires_at = row
     features = json.loads(features_json)
 
     # Check key expiry
@@ -259,7 +269,7 @@ def issue_license_for_activation(
         private_key_path=private_key_path,
         db_path=db_path,
         max_seats=max_seats,
-        minutes_valid=days_valid * 24 * 60,
+        minutes_valid=float(minutes_valid),
         now=now,
         customer=customer_name,
         customer_id=customer_id,
@@ -273,7 +283,7 @@ def issue_and_write(
     private_key_path: Path = DEFAULT_PRIVATE_KEY_PATH,
     db_path: Path = DEFAULT_DB_PATH,
     max_seats: int = DEFAULT_MAX_SEATS,
-    minutes_valid: int = 60,
+    minutes_valid: float = 60.0,
     bundle: bool = False,
 ) -> Path:
     """issue_license + write to disk. Used by the CLI."""

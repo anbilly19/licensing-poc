@@ -78,12 +78,12 @@ class HeartbeatResponse(BaseModel):
 
 
 class CreateKeyRequest(BaseModel):
-    activation_key: str
-    customer_id:    str
-    customer_name:  str
-    max_seats:      int            = 2
-    features:       List[str]      = ["rag_chat"]
-    days_valid:     int            = 365
+    activation_key:  str
+    customer_id:     str
+    customer_name:   str
+    max_seats:       int        = 2
+    features:        List[str]  = ["rag_chat"]
+    minutes_valid:   float      = 525600.0  # 365 days default; use small values for testing
 
 
 class CreateKeyResponse(BaseModel):
@@ -92,7 +92,7 @@ class CreateKeyResponse(BaseModel):
     customer_name:  str
     max_seats:      int
     features:       List[str]
-    days_valid:     int
+    minutes_valid:  float
 
 
 # ---------------------------------------------------------------------------
@@ -141,27 +141,25 @@ def activate(req: ActivateRequest) -> ActivateResponse:
 
 @app.post("/heartbeat", response_model=HeartbeatResponse)
 def heartbeat(req: HeartbeatRequest) -> HeartbeatResponse:
-    """Client calls this periodically (e.g. every 7 days) to renew the license.
+    """Client calls this periodically to renew the license.
 
     - If the activation key is still valid and machine is known: re-sign and return.
     - If revoked / expired: return {valid: false} — binary stops working at expiry.
     """
     conn = _init_db(_DB_PATH)
 
-    # Check the machine is still registered
     if not _is_known_machine(conn, req.machine_fingerprint):
         return HeartbeatResponse(valid=False, reason="Machine not registered.")
 
-    # Check activation key still valid
     row = conn.execute(
-        "SELECT customer_id, customer_name, max_seats, features, days_valid, expires_at "
+        "SELECT customer_id, customer_name, max_seats, features, minutes_valid, expires_at "
         "FROM activation_keys WHERE activation_key = ?",
         (req.activation_key,),
     ).fetchone()
     if row is None:
         return HeartbeatResponse(valid=False, reason="Activation key not found.")
 
-    _, _, _, _, days_valid, expires_at = row
+    _, _, _, _, minutes_valid, expires_at = row
     now = datetime.now(timezone.utc)
     if expires_at:
         exp_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
@@ -171,7 +169,6 @@ def heartbeat(req: HeartbeatRequest) -> HeartbeatResponse:
                 reason=f"License expired at {expires_at}. Please renew your subscription.",
             )
 
-    # Re-sign with a fresh validity window
     try:
         lic = issue_license_for_activation(
             activation_key=req.activation_key,
@@ -199,7 +196,7 @@ def admin_create_key(req: CreateKeyRequest) -> CreateKeyResponse:
         customer_name=req.customer_name,
         max_seats=req.max_seats,
         features=req.features,
-        days_valid=req.days_valid,
+        minutes_valid=req.minutes_valid,
         db_path=_DB_PATH,
     )
     return CreateKeyResponse(
@@ -208,7 +205,7 @@ def admin_create_key(req: CreateKeyRequest) -> CreateKeyResponse:
         customer_name=req.customer_name,
         max_seats=req.max_seats,
         features=req.features,
-        days_valid=req.days_valid,
+        minutes_valid=req.minutes_valid,
     )
 
 
