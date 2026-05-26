@@ -1,74 +1,61 @@
-import sys
-from pathlib import Path
-
 from src.fingerprint import get_machine_fingerprint
-from src.license_core import load_and_verify_license, LicenseError, License
+from src.license_core import load_and_verify_license, LicenseError
 
 
-class FeatureNotEnabledError(Exception):
-    pass
-
-
-def require_feature(license: License, feature: str) -> None:
-    if feature not in license.features:
-        raise FeatureNotEnabledError(f"Feature '{feature}' not enabled in your license")
-
-
-def run_rag(license: License) -> str:
-    require_feature(license, "rag_chat")
-    return "[RAG] Query executed."
-
-
-def run_transcriber(license: License) -> str:
-    require_feature(license, "transcriber")
-    return "[Transcriber] Audio transcribed."
-
-
-def run_nl_sql(license: License) -> str:
-    require_feature(license, "nl_sql")
-    return "[NL-SQL] Query generated."
-
-
-def run_reports(license: License) -> str:
-    require_feature(license, "reports")
-    return "[Reports] Report generated."
-
-
-COMMANDS = {
-    "rag": run_rag,
-    "transcribe": run_transcriber,
-    "nlsql": run_nl_sql,
-    "reports": run_reports,
-}
-
-
-def main(
-    license_path: Path = Path("license.json"),
-    public_key_path: Path = Path("public_key.pem"),
-    last_seen_path: Path = Path("last_seen.json"),
-):
+def main() -> None:
     fp = get_machine_fingerprint()
-    try:
-        lic = load_and_verify_license(license_path, public_key_path, fp, last_seen_path)
-    except LicenseError as e:
-        print(f"License error: {e}")
-        sys.exit(1)
 
-    print(f"License {lic.license_id} | {lic.customer} | valid until {lic.not_after}")
-    print(f"Features: {', '.join(lic.features)}")
-    print("Commands: " + ", ".join(COMMANDS) + ", quit")
+    try:
+        lic = load_and_verify_license(fp)
+    except LicenseError as exc:
+        print(f"[LICENSE ERROR] {exc}")
+        return
+
+    print()
+    print("=" * 50)
+    print(f"  OneMachine Licensing POC")
+    print("=" * 50)
+    print(f"  License ID : {lic.license_id}")
+    print(f"  Customer   : {lic.customer}")
+    print(f"  Valid until: {lic.not_after.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"  Features   : {', '.join(lic.features)}")
+    print("=" * 50)
+    print()
+
+    commands = {
+        "rag": ("rag_chat", "[RAG] Running a semantic search query... done."),
+        "transcribe": ("transcriber", "[Transcriber] Transcribing audio... done."),
+        "summarize": ("summarizer", "[Summarizer] Summarizing document... done."),
+    }
+
+    print("Commands: rag | transcribe | summarize | info | quit")
+    print()
 
     while True:
-        cmd = input("> ").strip().lower()
-        if cmd == "quit":
+        try:
+            cmd = input("onemachine> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye.")
             break
-        elif cmd in COMMANDS:
-            try:
-                print(COMMANDS[cmd](lic))
-            except FeatureNotEnabledError as e:
-                print(f"Access denied: {e}")
+
+        if cmd == "quit":
+            print("Goodbye.")
+            break
+        elif cmd == "info":
+            print(f"  License : {lic.license_id}")
+            print(f"  Features: {', '.join(lic.features)}")
+        elif cmd in commands:
+            feature_key, success_msg = commands[cmd]
+            if feature_key in lic.features:
+                print(success_msg)
+            else:
+                print(
+                    f"[DENIED] Feature '{feature_key}' is not enabled in your license."
+                )
+        elif cmd == "":
+            continue
         else:
-            print(f"Unknown command: {cmd!r}")
+            print(f"Unknown command '{cmd}'. Try: rag | transcribe | summarize | info | quit")
 
 
 if __name__ == "__main__":

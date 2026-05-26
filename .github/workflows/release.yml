@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: onemachine-license-linux
+            exe_name: onemachine-license
+          - os: windows-latest
+            artifact_name: onemachine-license-win.exe
+            exe_name: onemachine-license.exe
+          - os: macos-latest
+            artifact_name: onemachine-license-mac
+            exe_name: onemachine-license
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
+
+      - name: Install dependencies (including nuitka)
+        run: uv sync --locked --group dev
+
+      # Linux: install patchelf required by Nuitka onefile
+      - name: Install patchelf (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y patchelf
+
+      - name: Build executable
+        run: uv run python scripts/build_executables.py
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          mkdir -p release_artifacts
+          cp dist/${{ matrix.exe_name }} release_artifacts/${{ matrix.artifact_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: release_artifacts/${{ matrix.artifact_name }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_artifacts
+          merge-multiple: true
+
+      - name: Make Linux/macOS binaries executable
+        run: |
+          chmod +x release_artifacts/onemachine-license-linux || true
+          chmod +x release_artifacts/onemachine-license-mac || true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "OneMachine Licensing POC ${{ github.ref_name }}"
+          body: |
+            ## OneMachine Licensing POC ${{ github.ref_name }}
+
+            ### Vendor setup (Laptop A — run once)
+            ```
+            ./onemachine-license-linux keygen
+            # Copy public_key.pem to each client
+            ```
+
+            ### Client setup (Laptops B & C)
+            1. Download the binary for your platform below
+            2. Make it executable (Linux/Mac): `chmod +x onemachine-license-linux`
+            3. Get your fingerprint:
+               ```
+               ./onemachine-license-linux fingerprint
+               # sends fingerprint.txt to vendor
+               ```
+            4. Receive `license_<fp>.json` from vendor, rename to `license.json`
+            5. Place `public_key.pem` (from vendor) next to the binary
+            6. Run the demo:
+               ```
+               ./onemachine-license-linux demo
+               ```
+
+            ### Vendor issues a license
+            ```
+            ./onemachine-license-linux issue \\
+              --fingerprint <client_hex> \\
+              --features rag_chat,transcriber \\
+              --minutes 60
+            ```
+          files: |
+            release_artifacts/onemachine-license-linux
+            release_artifacts/onemachine-license-win.exe
+            release_artifacts/onemachine-license-mac

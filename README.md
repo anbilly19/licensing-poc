@@ -1,115 +1,135 @@
 # OneMachine Licensing POC
 
-A minimal proof-of-concept for the OneMachine offline licensing system, built step-by-step with TDD. Three machines: one issuer (Laptop A), two clients (Laptops B & C).
+Minimal proof-of-concept for **offline, node-locked, time-bound, feature-gated** software licensing.
+
+## Architecture
+
+- **Ed25519 signatures** — license tamper-proof without network calls
+- **Machine fingerprint** — SHA-256 of hostname + MAC address
+- **Time bounds** — `not_before` / `not_after` UTC timestamps
+- **Feature flags** — per-license module gating
+- **Seat cap** — SQLite-backed limit on concurrent machines (vendor side)
+- **Clock rollback detection** — local `last_seen.json` guard
+- **Fully offline** — client never needs internet after initial setup
 
 ---
 
-## What this demonstrates
+## Roles
 
-- **Node-locked seat** — license bound to a machine fingerprint (hostname + MAC hash).
-- **Time-limited validity** — `not_before` / `not_after` timestamps enforced at runtime.
-- **Clock-rollback detection** — `last_seen.json` monotonic check.
-- **Feature flags** — per-module gates (`rag_chat`, `transcriber`, etc.).
-- **Seat cap** — issuer refuses to sign more licenses than `MAX_SEATS` per product.
-- **Ed25519 signatures** — license payload signed on Laptop A, verified on clients with the public key only.
+| Role | Machine | Commands |
+|---|---|---|
+| Vendor | Laptop A | `keygen`, `issue` |
+| Client | Laptop B / C | `fingerprint`, `demo` |
 
 ---
 
-## Build Plan (TDD, step by step)
-
-Each phase: **write failing tests first → implement → verify tests pass → commit.**
-
-### Phase 0 — Repo skeleton
-```
-verify: repo created, CLAUDE.md present, README up to date, CI runs (empty)
-```
-- [ ] Create `src/` and `tests/` directories
-- [ ] Add `requirements.txt` (`cryptography`, `pytest`)
-- [ ] Add `pytest.ini` / `pyproject.toml`
-- [ ] Add GitHub Actions CI (`pytest` on push)
-
-### Phase 1 — Machine fingerprint
-```
-verify: test_fingerprint.py passes; fingerprint is stable across calls on same machine
-```
-- [ ] `tests/test_fingerprint.py` — assert fingerprint is 64-char hex, stable, non-empty
-- [ ] `src/fingerprint.py` — sha256(hostname + MAC)
-
-### Phase 2 — License file schema & signing (Laptop A)
-```
-verify: test_issuer.py passes; license JSON validates schema, signature verifies with public key
-```
-- [ ] `tests/test_issuer.py` — assert signed license parses, signature verifies, fields present
-- [ ] `src/keygen.py` — Ed25519 key generation
-- [ ] `src/issuer.py` — sign payload, write `license_<fp8>.json`, reject if seat cap reached
-
-### Phase 3 — License core / verification (Clients)
-```
-verify: test_license_core.py passes for valid license, expired license, wrong machine, tampered payload, clock rollback
-```
-- [ ] `tests/test_license_core.py` — parametrized tests for each failure mode
-- [ ] `src/license_core.py` — load + verify signature, fingerprint check, time window, clock rollback
-
-### Phase 4 — Feature gating
-```
-verify: test_feature_gate.py passes; disabled features raise clear error; enabled features pass through
-```
-- [ ] `tests/test_feature_gate.py`
-- [ ] `src/demo_app.py` — REPL wired to license core, feature checks per command
-
-### Phase 5 — Seat cap (Issuer)
-```
-verify: issuing MAX_SEATS+1 licenses raises SeatCapError; SQLite seats.db reflects counts
-```
-- [ ] `tests/test_seat_cap.py`
-- [ ] Update `src/issuer.py` with SQLite seat tracking
-
-### Phase 6 — End-to-end demo script
-```
-verify: running e2e.sh on three machines produces expected output for each scenario
-```
-- [ ] `scripts/e2e.sh` — automates fingerprint collection, license issuance, client verification
-- [ ] `docs/demo_runbook.md` — instructions for live three-laptop demo
-
----
-
-## Repo layout (target)
-
-```
-onemachine-licensing-poc/
-├── CLAUDE.md
-├── README.md
-├── requirements.txt
-├── pyproject.toml
-├── src/
-│   ├── fingerprint.py
-│   ├── keygen.py
-│   ├── issuer.py
-│   ├── license_core.py
-│   └── demo_app.py
-├── tests/
-│   ├── test_fingerprint.py
-│   ├── test_issuer.py
-│   ├── test_license_core.py
-│   ├── test_feature_gate.py
-│   └── test_seat_cap.py
-├── scripts/
-│   └── e2e.sh
-└── docs/
-    └── demo_runbook.md
-```
-
----
-
-## Setup
+## Quick Start (dev)
 
 ```bash
-pip install -r requirements.txt
-pytest
+# Install uv: https://docs.astral.sh/uv/
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install deps
+uv sync
+
+# Run tests
+uv run pytest -v
 ```
 
 ---
 
-## Architecture reference
+## Full Demo Flow (3 Laptops)
 
-See the [design thread context](docs/onemachine_licensing_design_thread_context.md) and the full OneMachine licensing design doc for the complete threat model, hardware fingerprint spec, and floating-seat extension plan.
+### Step 1 — Vendor: generate keypair (once)
+
+```bash
+uv run onemachine-license keygen
+# Outputs: private_key.pem, public_key.pem
+# Copy public_key.pem to Laptops B and C
+```
+
+### Step 2 — Client: get machine fingerprint
+
+```bash
+# On Laptop B or C:
+uv run onemachine-license fingerprint
+# Prints 64-char hex, saves fingerprint.txt
+# Send fingerprint.txt (or paste the hex) to the vendor
+```
+
+### Step 3 — Vendor: issue a license
+
+```bash
+# On Laptop A:
+uv run onemachine-license issue \
+  --fingerprint <hex from client> \
+  --features rag_chat,transcriber \
+  --minutes 60
+# Outputs: license_<fp8>.json
+# Send this file to the client as license.json
+```
+
+### Step 4 — Client: run the demo
+
+```bash
+# On Laptop B or C:
+# Place license.json and public_key.pem in the same directory
+uv run onemachine-license demo
+```
+
+---
+
+## Standalone Executables (no Python needed)
+
+### Download from GitHub Releases
+
+Go to [Releases](../../releases) and download the binary for your platform:
+
+| Platform | File |
+|---|---|
+| Linux | `onemachine-license-linux` |
+| Windows | `onemachine-license-win.exe` |
+| macOS | `onemachine-license-mac` |
+
+```bash
+# Linux / macOS
+chmod +x onemachine-license-linux
+./onemachine-license-linux fingerprint
+./onemachine-license-linux demo
+
+# Windows
+onemachine-license-win.exe fingerprint
+onemachine-license-win.exe demo
+```
+
+### Build locally
+
+```bash
+uv sync --group dev
+uv run python scripts/build_executables.py
+# Output: dist/onemachine-license
+```
+
+---
+
+## Release a new version
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+# GitHub Actions builds Linux/Windows/macOS executables
+# and publishes them to the GitHub Release automatically
+```
+
+---
+
+## Demo points to showcase
+
+| Scenario | How to demo |
+|---|---|
+| Node-locking | Copy license from B to C → DENIED (wrong fingerprint) |
+| Expiry | Issue a 2-min license → wait → re-run demo → EXPIRED |
+| Feature gating | Laptop C gets only `rag_chat` → `transcribe` is DENIED |
+| Seat cap | Try issuing a 3rd license on Laptop A → SEAT CAP error |
+| Offline | Disconnect all network on Laptop B → demo still works |
+| Clock rollback | Roll back system clock → ROLLBACK DETECTED error |

@@ -6,11 +6,11 @@ from pathlib import Path
 from typing import List
 
 from cryptography.hazmat.primitives import serialization
-from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-
-class LicenseError(Exception):
-    pass
+LICENSE_PATH = Path("license.json")
+PUBLIC_KEY_PATH = Path("public_key.pem")
+LAST_SEEN_PATH = Path("last_seen.json")
 
 
 @dataclass
@@ -25,50 +25,78 @@ class License:
     max_version: str
 
 
+class LicenseError(Exception):
+    pass
+
+
+def _load_public_key() -> Ed25519PublicKey:
+    if not PUBLIC_KEY_PATH.exists():
+        raise LicenseError(
+            "public_key.pem not found. Copy it from the vendor machine."
+        )
+    return serialization.load_pem_public_key(PUBLIC_KEY_PATH.read_bytes())
+
+
 def _parse_iso(ts: str) -> datetime:
-    return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    return datetime.fromisoformat(ts).astimezone(timezone.utc)
 
 
-def load_and_verify_license(
-    license_path: Path,
-    public_key_path: Path,
-    machine_fingerprint: str,
-    last_seen_path: Path,
-    now: datetime = None,
-) -> License:
-    if now is None:
-        now = datetime.now(timezone.utc)
+def _check_clock_rollback(now: datetime) -> None:
+    if LAST_SEEN_PATH.exists():
+        data = json.loads(LAST_SEEN_PATH.read_text())
+        last_seen = _parse_iso(data["last_seen"])
+        if now < last_seen:
+            raise LicenseError(
+                f"Clock rollback detected (now={now.isoformat()}, "
+                f"last_seen={last_seen.isoformat()}). "
+                "Restore the system clock and try again."
+            )
+    LAST_SEEN_PATH.write_text(
+        json.dumps({"last_seen": now.isoformat().replace("+00:00", "Z")})
+    )
 
-    if not license_path.exists():
-        raise LicenseError("License file not found")
 
-    data = json.loads(license_path.read_text())
-    payload = data["payload"]
-    sig = base64.b64decode(data["signature"])
+def load_and_verify_license(expected_fingerprint: str) -> License:
+    if not LICENSE_PATH.exists():
+        raise LicenseError(
+            "license.json not found. "
+            "Run 'onemachine-license fingerprint', send the output to the vendor, "
+            "then place the received license.json here."
+        )
 
-    public_key = serialization.load_pem_public_key(public_key_path.read_bytes())
-    payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    license_obj = json.loads(LICENSE_PATH.read_text())
+    payload = license_obj["payload"]
+    signature_b64 = license_obj["signature"]
+
+    payload_bytes = json.dumps(
+        payload, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    signature = base64.b64decode(signature_b64)
+
+    public_key = _load_public_key()
     try:
-        public_key.verify(sig, payload_bytes)
-    except InvalidSignature:
-        raise LicenseError("Invalid signature")
+        public_key.verify(signature, payload_bytes)
+    except Exception as exc:
+        raise LicenseError(f"Signature verification failed: {exc}") from exc
 
-    if payload["machine_fingerprint"] != machine_fingerprint:
-        raise LicenseError("License not issued for this machine")
+    if payload["machine_fingerprint"] != expected_fingerprint:
+        raise LicenseError(
+            "This license was issued for a different machine. "
+            "Request a new license with your machine fingerprint."
+        )
 
+    now = datetime.now(timezone.utc)
     not_before = _parse_iso(payload["not_before"])
     not_after = _parse_iso(payload["not_after"])
+
     if now < not_before:
-        raise LicenseError("License not yet valid")
+        raise LicenseError(f"License not yet valid (valid from {not_before}).")
     if now > not_after:
-        raise LicenseError("License expired")
+        raise LicenseError(f"License expired at {not_after}.")
 
-    if last_seen_path.exists():
-        last_seen = _parse_iso(json.loads(last_seen_path.read_text())["last_seen"])
-        if now < last_seen:
-            raise LicenseError("Clock rollback detected")
-
-    last_seen_path.write_text(json.dumps({"last_seen": now.isoformat().replace("+00:00", "Z")}))
+    _check_clock_rollback(now)
 
     return License(
         license_id=payload["license_id"],
