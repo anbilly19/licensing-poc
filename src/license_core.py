@@ -49,15 +49,13 @@ def _get_vendor_public_key() -> bytes:
     # Dev-only fallback — will NOT exist in the distributed binary.
     if _VENDOR_PUBLIC_KEY_FILE.exists():
         return _VENDOR_PUBLIC_KEY_FILE.read_bytes()
-    raise LicenseError(
-        "Vendor public key not found. This binary may be incomplete."
-    )
+    raise LicenseError("E0001")
 
 
 # Windows registry paths.
 _REGISTRY_KEY = r"Software\OneMachine\LicensePOC"
 _REGISTRY_VALUE = "last_seen_sig"
-_REGISTRY_ANCHOR_VALUE = "last_seen_anchor"   # FIX 3: separate anchor value
+_REGISTRY_ANCHOR_VALUE = "last_seen_anchor"
 
 # macOS Keychain service name (used by keyring library)
 _MACOS_KEYCHAIN_SERVICE = "com.onemachine.licensepoc"
@@ -65,29 +63,19 @@ _MACOS_KEYCHAIN_SIG_USER    = "last_seen_sig"
 _MACOS_KEYCHAIN_ANCHOR_USER = "last_seen_anchor"
 
 _XATTR_NAME = "user.onemachine_sig"
-_XATTR_ANCHOR_NAME = "user.onemachine_anchor"    # FIX 3
+_XATTR_ANCHOR_NAME = "user.onemachine_anchor"
 _LINUX_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor"
-_LINUX_ANCHOR_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor2"  # FIX 3
+_LINUX_ANCHOR_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor2"
 
 # FIX 5 — Block NUITKA_ONEFILE_DIRECTORY at startup before any imports from extracted dirs.
-# This must be the first thing that runs in __main__.py / the entry point.
 def _check_nuitka_env() -> None:
     """Abort if NUITKA_ONEFILE_DIRECTORY is set — prevents .so redirect attacks."""
     if os.environ.get("NUITKA_ONEFILE_DIRECTORY"):
-        raise SystemExit(
-            "NUITKA_ONEFILE_DIRECTORY is not permitted in this build. "
-            "Unset the environment variable and re-run."
-        )
+        raise SystemExit("E0002")
 
 
 # ---------------------------------------------------------------------------
 # FIX 3 — Two independent HMAC keys.
-#
-# _HMAC_SALT_PRIMARY  : signs last_seen.json entries
-# _HMAC_SALT_ANCHOR   : signs the out-of-band anchor (different domain)
-#
-# An attacker who forges last_seen.json cannot compute the anchor MAC without
-# also knowing _HMAC_SALT_ANCHOR, which is a different secret.
 # ---------------------------------------------------------------------------
 _HMAC_SALT_PRIMARY = b"0m-p0c-s4lt-v1-primary-d3f4ult-ch4ng3-b3f0r3-pr0d"
 _HMAC_SALT_ANCHOR  = b"0m-p0c-s4lt-v1-anchor--d3f4ult-ch4ng3-b3f0r3-pr0d"
@@ -126,12 +114,10 @@ def _parse_iso(ts: str) -> datetime:
 
 
 def _last_seen_hmac_key() -> bytes:
-    """Primary HMAC key — salted with _HMAC_SALT_PRIMARY only (no filesystem path)."""
     return hashlib.sha256(_HMAC_SALT_PRIMARY).digest()
 
 
 def _anchor_hmac_key() -> bytes:
-    """Anchor HMAC key — different salt, different trust domain."""
     return hashlib.sha256(_HMAC_SALT_ANCHOR).digest()
 
 
@@ -160,7 +146,6 @@ def _sign_entry(ts: str, prev_hash: str, key: bytes) -> str:
 
 
 def _sign_anchor(sig: str, key: bytes) -> str:
-    """Compute an anchor MAC over the primary sig using the *anchor* key."""
     return hmac.new(key, sig.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -284,44 +269,27 @@ def _check_clock_sanity(now: datetime, key: bytes) -> None:
 
     if ntp_now is not None and boot_estimate is not None:
         if abs(now - ntp_now) > _CLOCK_SKEW_TOLERANCE:
-            raise LicenseError(
-                f"System clock diverges from NTP by "
-                f"{abs(now - ntp_now).total_seconds():.0f}s — possible clock manipulation."
-            )
+            raise LicenseError("E0010")
         if abs(now - boot_estimate) > _CLOCK_SKEW_TOLERANCE:
-            raise LicenseError(
-                f"System clock diverges from boot-time estimate by "
-                f"{abs(now - boot_estimate).total_seconds():.0f}s — possible clock manipulation "
-                f"or VM snapshot restore."
-            )
+            raise LicenseError("E0011")
     elif ntp_now is not None:
         if abs(now - ntp_now) > _CLOCK_SKEW_TOLERANCE:
-            raise LicenseError(
-                f"System clock diverges from NTP by "
-                f"{abs(now - ntp_now).total_seconds():.0f}s — possible clock manipulation."
-            )
+            raise LicenseError("E0010")
     elif boot_estimate is not None:
         if abs(now - boot_estimate) > _CLOCK_SKEW_TOLERANCE:
-            raise LicenseError(
-                f"System clock diverges from boot-time estimate by "
-                f"{abs(now - boot_estimate).total_seconds():.0f}s — possible clock manipulation "
-                f"or VM snapshot restore."
-            )
-    # Neither available — degrade gracefully.
+            raise LicenseError("E0011")
 
 
 # ---------------------------------------------------------------------------
-# FIX 2 — libsecret anchor (Linux keychain — user cannot `rm` it)
-# Falls back to dotfile if libsecret is unavailable.
+# FIX 2 — libsecret anchor (Linux)
 # ---------------------------------------------------------------------------
 
 _LIBSECRET_SERVICE = "onemachine-licensing"
 _LIBSECRET_ATTR = {"app": "onemachine", "type": "last_seen_sig"}
-_LIBSECRET_ANCHOR_ATTR = {"app": "onemachine", "type": "last_seen_anchor"}  # FIX 3
+_LIBSECRET_ANCHOR_ATTR = {"app": "onemachine", "type": "last_seen_anchor"}
 
 
 def _libsecret_write(sig: str, anchor_mac: str) -> bool:
-    """Store sig + anchor_mac in GNOME Keyring / libsecret. Returns True on success."""
     try:
         import secretstorage  # type: ignore
         conn = secretstorage.dbus_init()
@@ -342,7 +310,6 @@ def _libsecret_write(sig: str, anchor_mac: str) -> bool:
 
 
 def _libsecret_read() -> Optional[Tuple[str, str]]:
-    """Read (sig, anchor_mac) from GNOME Keyring. Returns None if unavailable."""
     try:
         import secretstorage  # type: ignore
         conn = secretstorage.dbus_init()
@@ -362,26 +329,15 @@ def _libsecret_read() -> Optional[Tuple[str, str]]:
 
 # ---------------------------------------------------------------------------
 # FIX 2 (Windows) — DPAPI-encrypted registry anchor.
-#
-# HKLM (admin-required): stored as-is — elevation already provides tamper
-#   resistance; DPAPI is redundant at HKLM since only admins can write.
-# HKCU (user-writable): value encrypted with CryptProtectData (DPAPI).
-#   The ciphertext is machine+user-bound — copying it to another machine or
-#   another user account produces garbage on decryption.  An attacker who
-#   reads HKCU cannot forge or replay the anchor on a different machine.
 # ---------------------------------------------------------------------------
 
 def _dpapi_encrypt(plaintext: str) -> Optional[bytes]:
-    """Encrypt plaintext with DPAPI (user scope). Returns raw ciphertext bytes."""
     try:
-        import win32crypt  # type: ignore  # pip install pywin32
+        import win32crypt  # type: ignore
         encrypted = win32crypt.CryptProtectData(
             plaintext.encode("utf-8"),
-            "onemachine-anchor",  # data description (stored with blob, not secret)
-            None,                 # optional entropy
-            None,                 # reserved
-            None,                 # prompt struct
-            0,                    # flags — 0 = user scope (machine scope would be CRYPTPROTECT_LOCAL_MACHINE)
+            "onemachine-anchor",
+            None, None, None, 0,
         )
         return encrypted
     except Exception:
@@ -389,15 +345,10 @@ def _dpapi_encrypt(plaintext: str) -> Optional[bytes]:
 
 
 def _dpapi_decrypt(ciphertext: bytes) -> Optional[str]:
-    """Decrypt DPAPI ciphertext. Returns plaintext string, or None on failure."""
     try:
         import win32crypt  # type: ignore
         _, plaintext_bytes = win32crypt.CryptUnprotectData(
-            ciphertext,
-            None,   # optional entropy
-            None,   # reserved
-            None,   # prompt struct
-            0,      # flags
+            ciphertext, None, None, None, 0,
         )
         return plaintext_bytes.decode("utf-8")
     except Exception:
@@ -405,17 +356,10 @@ def _dpapi_decrypt(ciphertext: bytes) -> Optional[str]:
 
 
 def _registry_write(sig: str, anchor_mac: str) -> None:
-    """Write anchor to Windows registry.
-
-    HKLM: plaintext (requires admin to write — elevation = tamper resistance).
-    HKCU: DPAPI-encrypted (user-writable key, so we add cryptographic binding).
-    """
     if _system() != "Windows":
         return
     try:
         import winreg
-
-        # --- HKLM (admin-required, plaintext is acceptable) ---
         try:
             k = winreg.CreateKeyEx(
                 winreg.HKEY_LOCAL_MACHINE, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE
@@ -424,13 +368,10 @@ def _registry_write(sig: str, anchor_mac: str) -> None:
             winreg.SetValueEx(k, _REGISTRY_ANCHOR_VALUE, 0, winreg.REG_SZ, anchor_mac)
             winreg.CloseKey(k)
         except OSError:
-            pass  # no admin rights — fall through to HKCU
-
-        # --- HKCU (user-writable — encrypt with DPAPI so value is non-forgeable) ---
+            pass
         sig_enc        = _dpapi_encrypt(sig)
         anchor_mac_enc = _dpapi_encrypt(anchor_mac)
         if sig_enc is None or anchor_mac_enc is None:
-            # pywin32 not available — fall back to plaintext HKCU (weaker but functional)
             sig_enc_value        = sig
             anchor_mac_enc_value = anchor_mac
             reg_type             = winreg.REG_SZ
@@ -438,7 +379,6 @@ def _registry_write(sig: str, anchor_mac: str) -> None:
             sig_enc_value        = sig_enc
             anchor_mac_enc_value = anchor_mac_enc
             reg_type             = winreg.REG_BINARY
-
         k = winreg.CreateKeyEx(
             winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_SET_VALUE
         )
@@ -450,13 +390,10 @@ def _registry_write(sig: str, anchor_mac: str) -> None:
 
 
 def _registry_read() -> Optional[Tuple[str, str]]:
-    """Read anchor from Windows registry.  Prefers HKLM (admin-protected)."""
     if _system() != "Windows":
         return None
     try:
         import winreg
-
-        # --- HKLM first (plaintext, admin-protected) ---
         try:
             k = winreg.OpenKey(
                 winreg.HKEY_LOCAL_MACHINE, _REGISTRY_KEY, 0, winreg.KEY_READ
@@ -467,26 +404,20 @@ def _registry_read() -> Optional[Tuple[str, str]]:
             return sig, anchor_mac
         except (FileNotFoundError, OSError):
             pass
-
-        # --- HKCU fallback (DPAPI-encrypted or plaintext fallback) ---
         k = winreg.OpenKey(
             winreg.HKEY_CURRENT_USER, _REGISTRY_KEY, 0, winreg.KEY_READ
         )
         sig_raw,        reg_type_sig    = winreg.QueryValueEx(k, _REGISTRY_VALUE)
         anchor_mac_raw, reg_type_anchor = winreg.QueryValueEx(k, _REGISTRY_ANCHOR_VALUE)
         winreg.CloseKey(k)
-
         if reg_type_sig == winreg.REG_BINARY:
-            # Decrypt DPAPI blob
             sig        = _dpapi_decrypt(bytes(sig_raw))
             anchor_mac = _dpapi_decrypt(bytes(anchor_mac_raw))
             if sig is None or anchor_mac is None:
-                return None  # wrong machine / wrong user — treat as missing
+                return None
         else:
-            # Plain-text fallback (pywin32 unavailable at write time)
             sig        = sig_raw
             anchor_mac = anchor_mac_raw
-
         return sig, anchor_mac
     except (FileNotFoundError, OSError):
         pass
@@ -497,20 +428,11 @@ def _registry_read() -> Optional[Tuple[str, str]]:
 
 # ---------------------------------------------------------------------------
 # FIX 2 (macOS) — Keychain anchor via keyring library.
-#
-# Replaces `defaults write` (fully user-deletable plist in ~/Library/Preferences)
-# with the macOS Keychain.  Keychain items require user authentication to
-# delete (the OS prompts for password / Touch ID), equivalent to libsecret
-# protection on Linux.
-#
-# Requires:  pip install keyring
-# No extra C extension needed — keyring uses the system Keychain on macOS.
 # ---------------------------------------------------------------------------
 
 def _keychain_write(sig: str, anchor_mac: str) -> bool:
-    """Store sig + anchor_mac in the macOS Keychain. Returns True on success."""
     try:
-        import keyring  # type: ignore  # pip install keyring
+        import keyring  # type: ignore
         keyring.set_password(_MACOS_KEYCHAIN_SERVICE, _MACOS_KEYCHAIN_SIG_USER,    sig)
         keyring.set_password(_MACOS_KEYCHAIN_SERVICE, _MACOS_KEYCHAIN_ANCHOR_USER, anchor_mac)
         return True
@@ -519,7 +441,6 @@ def _keychain_write(sig: str, anchor_mac: str) -> bool:
 
 
 def _keychain_read() -> Optional[Tuple[str, str]]:
-    """Read (sig, anchor_mac) from the macOS Keychain. Returns None if unavailable."""
     try:
         import keyring  # type: ignore
         sig        = keyring.get_password(_MACOS_KEYCHAIN_SERVICE, _MACOS_KEYCHAIN_SIG_USER)
@@ -583,12 +504,6 @@ def _dotfile_read() -> Optional[Tuple[str, str]]:
 
 # ---------------------------------------------------------------------------
 # Unified anchor helpers
-# Returns / stores (sig, anchor_mac) pairs.
-#
-# Platform matrix after all VULN-2 fixes:
-#   Linux   — libsecret (Keyring, not user-rm-able)  → dotfile fallback
-#   Windows — HKLM plaintext (admin-protected)       → HKCU DPAPI-encrypted
-#   macOS   — Keychain via keyring (auth required to delete) [was: defaults write]
 # ---------------------------------------------------------------------------
 
 def _anchor_write(sig: str, anchor_mac: str, primary_path: Optional[Path] = None) -> None:
@@ -596,13 +511,10 @@ def _anchor_write(sig: str, anchor_mac: str, primary_path: Optional[Path] = None
     if system == "Windows":
         _registry_write(sig, anchor_mac)
     elif system == "Darwin":
-        wrote = _keychain_write(sig, anchor_mac)
-        if not wrote:
-            # keyring unavailable — log and degrade gracefully (no dotfile equiv on macOS)
-            pass
+        _keychain_write(sig, anchor_mac)
     elif system == "Linux":
         wrote_keychain = _libsecret_write(sig, anchor_mac)
-        if not wrote_keychain:  # graceful fallback
+        if not wrote_keychain:
             _dotfile_write(sig, anchor_mac)
         if primary_path is not None:
             _xattr_write(primary_path, sig, anchor_mac)
@@ -637,10 +549,10 @@ def _read_entry(path: Path, key: bytes) -> Tuple[str, str, str]:
         prev_hash: str = data["prev_hash"]
         stored_sig: str = data["sig"]
     except (KeyError, json.JSONDecodeError):
-        raise LicenseError(f"{path} is malformed or missing fields. Possible tamper.")
+        raise LicenseError("E0020")
     expected_sig = _sign_entry(ts, prev_hash, key)
     if not hmac.compare_digest(stored_sig, expected_sig):
-        raise LicenseError(f"{path} signature invalid. File has been tampered with.")
+        raise LicenseError("E0021")
     return ts, prev_hash, _hash_entry(ts, prev_hash)
 
 
@@ -667,18 +579,12 @@ def _check_clock_rollback(
     primary_exists = last_seen_path.exists()
     mirror_exists  = mirror_path.exists()
 
-    # Clock sanity (NTP + boot-time)
     _check_clock_sanity(now, primary_key)
 
-    # --- First run: neither file exists ---
     if not primary_exists and not mirror_exists:
         anchor = _anchor_read(primary_path=last_seen_path)
-        # FIX 2: if any anchor exists (keychain, registry, dotfile), refuse cold-start.
         if anchor is not None:
-            raise LicenseError(
-                "last_seen files are missing but a system anchor entry exists. "
-                "Possible tamper: delete the keychain entry or reinstall."
-            )
+            raise LicenseError("E0030")
         genesis_hash = "0" * 64
         sig = _sign_entry(ts_now, genesis_hash, primary_key)
         anchor_mac = _sign_anchor(sig, anchor_key)
@@ -689,49 +595,31 @@ def _check_clock_rollback(
             _boot_anchor_write(now, uptime_now, primary_key)
         return
 
-    # --- Deletion detection ---
     if not primary_exists and mirror_exists:
-        raise LicenseError(
-            "last_seen.json was deleted while a mirror entry still exists. Possible tamper."
-        )
+        raise LicenseError("E0031")
     if primary_exists and not mirror_exists:
-        raise LicenseError(
-            "Mirror last_seen was deleted while primary entry still exists. Possible tamper."
-        )
+        raise LicenseError("E0032")
 
-    # --- Validate both files ---
     ts_primary, prev_hash_primary, entry_hash_primary = _read_entry(last_seen_path, primary_key)
     ts_mirror,  prev_hash_mirror,  entry_hash_mirror  = _read_entry(mirror_path,    primary_key)
 
     if not hmac.compare_digest(entry_hash_primary, entry_hash_mirror):
-        raise LicenseError(
-            "Primary and mirror last_seen do not match. File swap or tamper detected."
-        )
+        raise LicenseError("E0033")
 
-    # --- Third-anchor cross-check (FIX 3: verify BOTH sig and anchor_mac) ---
     anchor_pair = _anchor_read(primary_path=last_seen_path)
     if anchor_pair is not None:
         stored_sig, stored_anchor_mac = anchor_pair
         expected_sig = _sign_entry(ts_primary, prev_hash_primary, primary_key)
         if not hmac.compare_digest(stored_sig, expected_sig):
-            raise LicenseError(
-                "last_seen.json does not match system anchor (sig mismatch). "
-                "File may have been replaced or tampered with."
-            )
+            raise LicenseError("E0034")
         expected_anchor_mac = _sign_anchor(stored_sig, anchor_key)
         if not hmac.compare_digest(stored_anchor_mac, expected_anchor_mac):
-            raise LicenseError(
-                "Anchor MAC mismatch — anchor file may have been forged."
-            )
+            raise LicenseError("E0035")
 
-    # --- Chain rollback check ---
     last_seen_dt = _parse_iso(ts_primary)
     if now < last_seen_dt:
-        raise LicenseError(
-            f"Clock rollback detected (now={now.isoformat()}, last_seen={last_seen_dt.isoformat()})."
-        )
+        raise LicenseError("E0036")
 
-    # --- Write next chained entry + refresh boot anchor ---
     new_sig = _sign_entry(ts_now, entry_hash_primary, primary_key)
     new_anchor_mac = _sign_anchor(new_sig, anchor_key)
     _write_entry(last_seen_path, ts_now, entry_hash_primary, primary_key)
@@ -756,18 +644,13 @@ def load_and_verify_license(
     NOTE: public_key_path parameter removed — the vendor key is now embedded
     in the binary via _get_vendor_public_key().  Do not pass a path.
     """
-    # FIX 5: block NUITKA_ONEFILE_DIRECTORY at the earliest opportunity.
     _check_nuitka_env()
 
     if now is None:
         now = datetime.now(timezone.utc)
 
     if not license_path.exists():
-        raise LicenseError(
-            f"{license_path} not found. "
-            "Run 'onemachine-license fingerprint', send the output to the vendor, "
-            "then place the received license.json here."
-        )
+        raise LicenseError("E0040")
 
     license_obj      = json.loads(license_path.read_text())
     payload          = license_obj["payload"]
@@ -775,26 +658,22 @@ def load_and_verify_license(
     payload_bytes    = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     signature        = base64.b64decode(signature_b64)
 
-    # FIX 1: load public key from embedded constant, never from disk.
     public_key = serialization.load_pem_public_key(_get_vendor_public_key())
     try:
         public_key.verify(signature, payload_bytes)
-    except Exception as exc:
-        raise LicenseError(f"Invalid signature: {exc}") from exc
+    except Exception:
+        raise LicenseError("E0041")
 
     if payload["machine_fingerprint"] != expected_fingerprint:
-        raise LicenseError(
-            "This license was not issued for this machine. "
-            "Request a new license with your machine fingerprint."
-        )
+        raise LicenseError("E0042")
 
     not_before = _parse_iso(payload["not_before"])
     not_after  = _parse_iso(payload["not_after"])
 
     if now < not_before:
-        raise LicenseError(f"License not yet valid (valid from {not_before}).")
+        raise LicenseError("E0043")
     if now > not_after:
-        raise LicenseError(f"License expired at {not_after}.")
+        raise LicenseError("E0044")
 
     _check_clock_rollback(now, last_seen_path)
 
