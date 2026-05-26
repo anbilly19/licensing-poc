@@ -15,7 +15,7 @@ DEFAULT_MAX_SEATS = 2
 
 
 class SeatCapError(RuntimeError):
-    """Raised when the seat cap has been reached."""
+    """Raised when the seat cap has been reached by a new (unknown) machine."""
 
 
 def _init_db(db_path: Path) -> sqlite3.Connection:
@@ -23,9 +23,9 @@ def _init_db(db_path: Path) -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS issued_licenses (
-            license_id   TEXT PRIMARY KEY,
+            license_id          TEXT PRIMARY KEY,
             machine_fingerprint TEXT UNIQUE,
-            issued_at    TEXT
+            issued_at           TEXT
         )
         """
     )
@@ -33,9 +33,19 @@ def _init_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _count_seats(conn: sqlite3.Connection) -> int:
-    (count,) = conn.execute("SELECT COUNT(*) FROM issued_licenses").fetchone()
+def _count_unique_machines(conn: sqlite3.Connection) -> int:
+    (count,) = conn.execute(
+        "SELECT COUNT(DISTINCT machine_fingerprint) FROM issued_licenses"
+    ).fetchone()
     return count
+
+
+def _is_known_machine(conn: sqlite3.Connection, machine_fingerprint: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM issued_licenses WHERE machine_fingerprint = ?",
+        (machine_fingerprint,),
+    ).fetchone()
+    return row is not None
 
 
 def issue_license(
@@ -47,34 +57,43 @@ def issue_license(
     minutes_valid: int = 60,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """Sign and store a license. Returns the license dict (payload + signature)."""
+    """Sign and store a license.
+
+    - Known machines (renewals): always allowed, overwrites the existing seat.
+    - New machines: blocked if seat cap is reached.
+    Returns the license dict {payload, signature}.
+    """
     if now is None:
         now = datetime.now(timezone.utc)
 
     conn = _init_db(db_path)
+    is_renewal = _is_known_machine(conn, machine_fingerprint)
 
-    existing = conn.execute(
-        "SELECT license_id FROM issued_licenses WHERE machine_fingerprint = ?",
-        (machine_fingerprint,),
-    ).fetchone()
-    if existing:
-        raise RuntimeError(
-            f"License already issued for this machine ({existing[0]})."
-        )
-
-    seats_used = _count_seats(conn)
-    if seats_used >= max_seats:
-        raise SeatCapError(
-            f"Seat cap reached ({seats_used}/{max_seats}). "
-            "No more licenses can be issued."
-        )
+    if not is_renewal:
+        seats_used = _count_unique_machines(conn)
+        if seats_used >= max_seats:
+            raise SeatCapError(
+                f"Seat cap reached ({seats_used}/{max_seats}). "
+                "No more new machines can be licensed."
+            )
 
     private_key = serialization.load_pem_private_key(
         private_key_path.read_bytes(), password=None
     )
 
+    # Determine license_id: reuse existing id for renewals
+    existing = conn.execute(
+        "SELECT license_id FROM issued_licenses WHERE machine_fingerprint = ?",
+        (machine_fingerprint,),
+    ).fetchone()
+    if existing:
+        license_id = existing[0]
+    else:
+        seat_number = _count_unique_machines(conn) + 1
+        license_id = f"L-{seat_number:04d}"
+
     payload: Dict[str, Any] = {
-        "license_id": f"L-{seats_used + 1:04d}",
+        "license_id": license_id,
         "customer": "DemoCorp",
         "machine_fingerprint": machine_fingerprint,
         "not_before": now.isoformat().replace("+00:00", "Z"),
@@ -91,9 +110,16 @@ def issue_license(
     ).encode("utf-8")
     signature_b64 = base64.b64encode(private_key.sign(payload_bytes)).decode("ascii")
 
+    # Upsert: insert new or update existing seat
     conn.execute(
-        "INSERT INTO issued_licenses (license_id, machine_fingerprint, issued_at) VALUES (?, ?, ?)",
-        (payload["license_id"], machine_fingerprint, now.isoformat()),
+        """
+        INSERT INTO issued_licenses (license_id, machine_fingerprint, issued_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(machine_fingerprint) DO UPDATE SET
+            license_id = excluded.license_id,
+            issued_at  = excluded.issued_at
+        """,
+        (license_id, machine_fingerprint, now.isoformat()),
     )
     conn.commit()
 
@@ -109,18 +135,25 @@ def issue_and_write(
     minutes_valid: int = 60,
 ) -> Path:
     """issue_license + write to disk. Used by the CLI."""
+    conn = _init_db(db_path)
+    is_renewal = _is_known_machine(conn, machine_fingerprint)
+
     lic = issue_license(
         machine_fingerprint, features, private_key_path, db_path, max_seats, minutes_valid
     )
+
     filename = Path(f"license_{machine_fingerprint[:8]}.json")
     filename.write_text(json.dumps(lic, indent=2))
 
-    seats_used = _count_seats(_init_db(db_path))
-    print(f"Issued {lic['payload']['license_id']}")
+    seats_used = _count_unique_machines(_init_db(db_path))
+    action = "Renewed" if is_renewal else "Issued"
+    print(f"{action} {lic['payload']['license_id']}")
     print(f"  machine : {machine_fingerprint}")
     print(f"  features: {', '.join(features)}")
     print(f"  valid   : {minutes_valid} minutes")
     print(f"  file    : {filename}")
-    print(f"  seats   : {seats_used}/{max_seats}")
+    print(f"  seats   : {seats_used}/{max_seats} unique machines")
+    if is_renewal:
+        print("  [renewal — existing seat updated, no new seat consumed]")
     print("Send this file to the client as license.json")
     return filename
