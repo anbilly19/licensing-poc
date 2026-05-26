@@ -3,6 +3,7 @@ import json
 import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from src.keygen import generate_keypair
 from src.issuer import issue_license
@@ -11,8 +12,6 @@ from src.license_core import load_and_verify_license, LicenseError
 FINGERPRINT = "a" * 64
 FEATURES = ["rag_chat", "transcriber"]
 NOW = datetime(2026, 5, 22, 15, 0, 0, tzinfo=timezone.utc)
-# Issue license starting 10 min before NOW, valid for 30 min.
-# This ensures NOW and NOW-5min are both inside the validity window.
 LICENSE_START = NOW - timedelta(minutes=10)
 
 
@@ -29,8 +28,20 @@ def env(tmp_path):
     return {"pub": pub, "lic": lic_path, "last_seen": last_seen, "tmp": tmp_path}
 
 
+def _load(env, fingerprint=FINGERPRINT, now=NOW):
+    """Call load_and_verify_license with the test-generated public key patched in."""
+    pub_bytes = env["pub"].read_bytes()
+    with patch("src.license_core._get_vendor_public_key", return_value=pub_bytes):
+        return load_and_verify_license(
+            license_path=env["lic"],
+            expected_fingerprint=fingerprint,
+            last_seen_path=env["last_seen"],
+            now=now,
+        )
+
+
 def test_valid_license_loads(env):
-    lic = load_and_verify_license(env["lic"], env["pub"], FINGERPRINT, env["last_seen"], now=NOW)
+    lic = _load(env)
     assert lic.license_id == "L-0001"
     assert "rag_chat" in lic.features
 
@@ -38,12 +49,12 @@ def test_valid_license_loads(env):
 def test_expired_license_raises(env):
     future = NOW + timedelta(hours=2)
     with pytest.raises(LicenseError, match="expired"):
-        load_and_verify_license(env["lic"], env["pub"], FINGERPRINT, env["last_seen"], now=future)
+        _load(env, now=future)
 
 
 def test_wrong_machine_raises(env):
     with pytest.raises(LicenseError, match="not issued for this machine"):
-        load_and_verify_license(env["lic"], env["pub"], "b" * 64, env["last_seen"], now=NOW)
+        _load(env, fingerprint="b" * 64)
 
 
 def test_tampered_payload_raises(env):
@@ -51,19 +62,19 @@ def test_tampered_payload_raises(env):
     data["payload"]["customer"] = "HACKED"
     env["lic"].write_text(json.dumps(data))
     with pytest.raises(LicenseError, match="Invalid signature"):
-        load_and_verify_license(env["lic"], env["pub"], FINGERPRINT, env["last_seen"], now=NOW)
+        _load(env)
 
 
 def test_clock_rollback_raises(env):
     # First call at NOW sets last_seen
-    load_and_verify_license(env["lic"], env["pub"], FINGERPRINT, env["last_seen"], now=NOW)
+    _load(env, now=NOW)
     # Second call 5 min earlier — still inside validity window, but behind last_seen
     earlier = NOW - timedelta(minutes=5)
     with pytest.raises(LicenseError, match="Clock rollback"):
-        load_and_verify_license(env["lic"], env["pub"], FINGERPRINT, env["last_seen"], now=earlier)
+        _load(env, now=earlier)
 
 
 def test_missing_license_file_raises(env):
     env["lic"].unlink()
     with pytest.raises(LicenseError, match="not found"):
-        load_and_verify_license(env["lic"], env["pub"], FINGERPRINT, env["last_seen"], now=NOW)
+        _load(env)

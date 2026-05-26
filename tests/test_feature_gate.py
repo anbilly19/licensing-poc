@@ -28,10 +28,14 @@ def make_license(tmp_path):
         lic_path.write_text(json.dumps(lic_obj))
         last_seen = tmp_path / "last_seen.json"
         last_seen.unlink(missing_ok=True)
-        with patch("src.license_core.datetime") as mock_dt:
-            mock_dt.now.return_value = NOW
-            mock_dt.fromisoformat = datetime.fromisoformat
-        return load_and_verify_license(lic_path, pub, FINGERPRINT, last_seen, now=NOW)
+        pub_bytes = pub.read_bytes()
+        with patch("src.license_core._get_vendor_public_key", return_value=pub_bytes):
+            return load_and_verify_license(
+                license_path=lic_path,
+                expected_fingerprint=FINGERPRINT,
+                last_seen_path=last_seen,
+                now=NOW,
+            )
 
     return _make
 
