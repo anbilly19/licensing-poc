@@ -39,6 +39,7 @@ def cmd_issue(args: argparse.Namespace) -> None:
         db_path=Path("seats.db"),
         minutes_valid=args.minutes,
         bundle=args.bundle,
+        max_seats=args.max_seats,
     )
 
 
@@ -107,8 +108,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="License validity in minutes (default: 60)",
     )
     p_issue.add_argument(
+        "--max-seats", type=int, default=2, metavar="N",
+        help="Maximum number of unique machines allowed (default: 2)",
+    )
+    p_issue.add_argument(
         "--bundle", action="store_true", default=False,
-        help="Also write a license_bundle_<fp8>.json with public_key embedded (send this single file to client)",
+        help="Also write a license_bundle_<fp8>.json with public_key embedded",
     )
 
     p_install = sub.add_parser(
