@@ -18,6 +18,17 @@ Production notes:
     - ADMIN_TOKEN must be a strong random secret (e.g. openssl rand -hex 32).
     - DB_PATH should point to a persistent volume.
     - private_key.pem must NEVER be committed to the repo; inject via secret.
+
+Error code reference (internal, never exposed to clients):
+    E1001 — activation key not found or invalid
+    E1002 — seat cap reached for this activation key
+    E1003 — internal activation error
+    E2001 — machine not recognised during heartbeat
+    E2002 — activation key not found during heartbeat
+    E2003 — license validation period ended; contact vendor
+    E2004 — internal heartbeat error
+    E3001 — admin bearer token missing
+    E3002 — admin bearer token invalid
 """
 from __future__ import annotations
 
@@ -74,7 +85,7 @@ class HeartbeatRequest(BaseModel):
 class HeartbeatResponse(BaseModel):
     valid:   bool
     license: Optional[dict] = None
-    reason:  Optional[str]  = None
+    code:    Optional[str]  = None
 
 
 class CreateKeyRequest(BaseModel):
@@ -101,10 +112,10 @@ class CreateKeyResponse(BaseModel):
 
 def _require_admin(authorization: str = Header(...)) -> None:
     if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Bearer token required.")
+        raise HTTPException(status_code=401, detail="E3001")
     token = authorization.removeprefix("Bearer ").strip()
     if token != _ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid admin token.")
+        raise HTTPException(status_code=403, detail="E3002")
 
 
 # ---------------------------------------------------------------------------
@@ -127,12 +138,12 @@ def activate(req: ActivateRequest) -> ActivateResponse:
             db_path=_DB_PATH,
         )
         return ActivateResponse(license=lic)
-    except InvalidActivationKeyError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except SeatCapError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Activation failed: {e}")
+    except InvalidActivationKeyError:
+        raise HTTPException(status_code=422, detail="E1001")
+    except SeatCapError:
+        raise HTTPException(status_code=422, detail="E1002")
+    except Exception:
+        raise HTTPException(status_code=422, detail="E1003")
 
 
 # ---------------------------------------------------------------------------
@@ -144,12 +155,12 @@ def heartbeat(req: HeartbeatRequest) -> HeartbeatResponse:
     """Client calls this periodically to renew the license.
 
     - If the activation key is still valid and machine is known: re-sign and return.
-    - If revoked / expired: return {valid: false} — binary stops working at expiry.
+    - If revoked / expired: return {valid: false, code: <Exxxx>}.
     """
     conn = _init_db(_DB_PATH)
 
     if not _is_known_machine(conn, req.machine_fingerprint):
-        return HeartbeatResponse(valid=False, reason="Machine not registered.")
+        return HeartbeatResponse(valid=False, code="E2001")
 
     row = conn.execute(
         "SELECT customer_id, customer_name, max_seats, features, minutes_valid, expires_at "
@@ -157,17 +168,14 @@ def heartbeat(req: HeartbeatRequest) -> HeartbeatResponse:
         (req.activation_key,),
     ).fetchone()
     if row is None:
-        return HeartbeatResponse(valid=False, reason="Activation key not found.")
+        return HeartbeatResponse(valid=False, code="E2002")
 
     _, _, _, _, minutes_valid, expires_at = row
     now = datetime.now(timezone.utc)
     if expires_at:
         exp_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
         if now > exp_dt:
-            return HeartbeatResponse(
-                valid=False,
-                reason=f"License expired at {expires_at}. Please renew your subscription.",
-            )
+            return HeartbeatResponse(valid=False, code="E2003")
 
     try:
         lic = issue_license_for_activation(
@@ -178,8 +186,8 @@ def heartbeat(req: HeartbeatRequest) -> HeartbeatResponse:
             now=now,
         )
         return HeartbeatResponse(valid=True, license=lic)
-    except Exception as e:
-        return HeartbeatResponse(valid=False, reason=str(e))
+    except Exception:
+        return HeartbeatResponse(valid=False, code="E2004")
 
 
 # ---------------------------------------------------------------------------
@@ -215,4 +223,4 @@ def admin_create_key(req: CreateKeyRequest) -> CreateKeyResponse:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok"}
