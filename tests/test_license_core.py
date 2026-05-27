@@ -48,12 +48,12 @@ def test_valid_license_loads(env):
 
 def test_expired_license_raises(env):
     future = NOW + timedelta(hours=2)
-    with pytest.raises(LicenseError, match="expired"):
+    with pytest.raises(LicenseError, match="E0044"):
         _load(env, now=future)
 
 
 def test_wrong_machine_raises(env):
-    with pytest.raises(LicenseError, match="not issued for this machine"):
+    with pytest.raises(LicenseError, match="E0042"):
         _load(env, fingerprint="b" * 64)
 
 
@@ -61,7 +61,7 @@ def test_tampered_payload_raises(env):
     data = json.loads(env["lic"].read_text())
     data["payload"]["customer"] = "HACKED"
     env["lic"].write_text(json.dumps(data))
-    with pytest.raises(LicenseError, match="Invalid signature"):
+    with pytest.raises(LicenseError, match="E0041"):
         _load(env)
 
 
@@ -70,11 +70,11 @@ def test_clock_rollback_raises(env):
     _load(env, now=NOW)
     # Second call 5 min earlier — still inside validity window, but behind last_seen
     earlier = NOW - timedelta(minutes=5)
-    with pytest.raises(LicenseError, match="Clock rollback"):
+    with pytest.raises(LicenseError, match="E0036"):
         _load(env, now=earlier)
 
 
 def test_missing_license_file_raises(env):
     env["lic"].unlink()
-    with pytest.raises(LicenseError, match="not found"):
+    with pytest.raises(LicenseError, match="E0040"):
         _load(env)
