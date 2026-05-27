@@ -672,7 +672,8 @@ def load_and_verify_license(
 
     if now < not_before:
         raise LicenseError("E0043")
-    if now > not_after:
+    # FIX: use >= so a license is rejected at the exact second of expiry
+    if now >= not_after:
         raise LicenseError("E0044")
 
     _check_clock_rollback(now, last_seen_path)

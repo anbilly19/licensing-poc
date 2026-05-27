@@ -87,16 +87,18 @@ def test_activate_invalid_key_returns_E1001(client):
 
 
 def test_activate_seat_cap_returns_E1002(client, server_env):
-    """Exceed seat cap (max_seats=2) -> E1002."""
-    for i in range(2):
+    """Exceed seat cap (max_seats=2): activate 2 distinct machines, then a 3rd -> E1002."""
+    # Activate two unique machines to fill all seats
+    for fp in ["b" * 64, "c" * 64]:
         r = client.post("/activate", json={
             "activation_key": ACT_KEY,
-            "machine_fingerprint": "b" * 64,
+            "machine_fingerprint": fp,
         })
-    # Third unique machine should hit the cap
+        assert r.status_code == 200
+    # Third unique machine must be rejected
     r = client.post("/activate", json={
         "activation_key": ACT_KEY,
-        "machine_fingerprint": "c" * 64,
+        "machine_fingerprint": "d" * 64,
     })
     assert r.status_code == 422
     assert r.json()["detail"] == "E1002"
@@ -162,16 +164,19 @@ def test_heartbeat_expired_key_returns_E2003(client, server_env):
         minutes_valid=-1.0,   # already expired
         db_path=server_env["db"],
     )
-    # Activate first so machine is known, using a direct DB insert trick:
-    # issue_license_for_activation would reject it, so we seed the machine manually.
+    # Seed the machine directly into issued_licenses so heartbeat sees it as known
     conn = _init_db(server_env["db"])
     conn.execute(
-        "INSERT OR IGNORE INTO seats (activation_key, machine_fingerprint) VALUES (?, ?)",
-        (exp_key, FINGERPRINT),
+        """
+        INSERT OR IGNORE INTO issued_licenses
+            (license_id, machine_fingerprint, customer_id, activation_key, issued_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("L-exp", FINGERPRINT, "cust-exp", exp_key, "2026-01-01T00:00:00Z"),
     )
     conn.commit()
     r = client.post("/heartbeat", json={
-        "license_id": "L-0001",
+        "license_id": "L-exp",
         "machine_fingerprint": FINGERPRINT,
         "activation_key": exp_key,
     })

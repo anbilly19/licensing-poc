@@ -41,11 +41,19 @@ def _load(env, fingerprint=FINGERPRINT, now=NOW):
 
 def test_vendor_public_key_missing_raises_E0001(env):
     """_get_vendor_public_key finds neither embedded bytes nor dev file -> E0001."""
+    # Must NOT use _load() here — that helper patches _get_vendor_public_key to
+    # return valid bytes, which would override the intent of this test.
+    # Call load_and_verify_license directly with both key sources absent.
     with patch("src.license_core._VENDOR_PUBLIC_KEY_PEM", None), \
          patch("src.license_core._VENDOR_PUBLIC_KEY_FILE",
                env["tmp"] / "nonexistent_pub.pem"):
         with pytest.raises(LicenseError, match="E0001"):
-            _load(env, now=NOW)
+            load_and_verify_license(
+                license_path=env["lic"],
+                expected_fingerprint=FINGERPRINT,
+                last_seen_path=env["last_seen"],
+                now=NOW,
+            )
 
 
 def test_multiple_sequential_loads_succeed(env):
