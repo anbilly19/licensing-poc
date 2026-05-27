@@ -9,6 +9,9 @@ description = "Minimal offline licensing POC: node-locked, time-bound, feature-g
 requires-python = ">=3.11"
 dependencies = [
     "cryptography>=42.0.0",
+    "fastapi>=0.136.3",
+    "keyring>=25.7.0",
+    "uvicorn>=0.48.0",
 ]
 
 [project.scripts]
