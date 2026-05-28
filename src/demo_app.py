@@ -1,4 +1,7 @@
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+
 from src.fingerprint import get_machine_fingerprint
 from src.license_core import (
     load_and_verify_license,
@@ -7,6 +10,10 @@ from src.license_core import (
     DEFAULT_LICENSE_PATH,
     DEFAULT_LAST_SEEN_PATH,
 )
+
+# How often (seconds) to re-verify the license inside the REPL loop.
+# Expired licenses are caught within this interval even if the user is idle.
+_RECHECK_INTERVAL_SECONDS = 60
 
 
 class FeatureNotEnabledError(Exception):
@@ -48,15 +55,20 @@ _COMMANDS = {
 }
 
 
+def _load_license(fp: str) -> License:
+    """Load and verify license; raises LicenseError on any problem."""
+    return load_and_verify_license(
+        license_path=DEFAULT_LICENSE_PATH,
+        expected_fingerprint=fp,
+        last_seen_path=DEFAULT_LAST_SEEN_PATH,
+    )
+
+
 def main() -> None:
     fp = get_machine_fingerprint()
 
     try:
-        lic = load_and_verify_license(
-            license_path=DEFAULT_LICENSE_PATH,
-            expected_fingerprint=fp,
-            last_seen_path=DEFAULT_LAST_SEEN_PATH,
-        )
+        lic = _load_license(fp)
     except LicenseError as exc:
         print(f"[LICENSE ERROR] {exc}")
         return
@@ -67,13 +79,34 @@ def main() -> None:
     print("=" * 50)
     print(f"  License ID : {lic.license_id}")
     print(f"  Customer   : {lic.customer}")
-    print(f"  Valid until: {lic.not_after.date()}")
+    print(f"  Valid until: {lic.not_after.strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"  Features   : {', '.join(lic.features)}")
     print("=" * 50)
     print()
 
-    import sys
+    last_checked = time.monotonic()
+
     while True:
+        # Periodic re-verification: catches expiry even when the user is idle.
+        now_mono = time.monotonic()
+        if now_mono - last_checked >= _RECHECK_INTERVAL_SECONDS:
+            try:
+                lic = _load_license(fp)
+                last_checked = now_mono
+            except LicenseError as exc:
+                print(f"\n[LICENSE EXPIRED] {exc} — session terminated.")
+                return
+
+        # Also verify on every command so expiry is caught immediately on next input.
+        now_utc = datetime.now(timezone.utc)
+        if now_utc >= lic.not_after:
+            try:
+                lic = _load_license(fp)
+                last_checked = time.monotonic()
+            except LicenseError as exc:
+                print(f"\n[LICENSE EXPIRED] {exc} — session terminated.")
+                return
+
         print("Commands: rag | transcribe | sql | reports | quit")
         try:
             cmd = input("> ").strip().lower()

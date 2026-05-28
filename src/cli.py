@@ -55,7 +55,8 @@ def cmd_create_key(args: argparse.Namespace) -> None:
         customer_name=args.customer_name,
         max_seats=args.max_seats,
         features=features,
-        minutes_valid=args.minutes,
+        license_minutes=args.license_minutes,
+        subscription_days=args.subscription_days,
         db_path=Path(args.db) if args.db else Path("seats.db"),
     )
 
@@ -152,17 +153,21 @@ def build_parser() -> argparse.ArgumentParser:
         "create-key",
         help="(Vendor) Register an activation key for a customer in seats.db",
     )
-    p_ck.add_argument("--activation-key",  required=True, metavar="KEY",
+    p_ck.add_argument("--activation-key",   required=True, metavar="KEY",
                       help="e.g. MULL-2024-ABCD-EFGH")
-    p_ck.add_argument("--customer-id",     required=True, metavar="ID",
+    p_ck.add_argument("--customer-id",      required=True, metavar="ID",
                       help="e.g. cust-de-0042")
-    p_ck.add_argument("--customer-name",   required=True, metavar="NAME",
-                      help="e.g. 'Müller GmbH'")
-    p_ck.add_argument("--max-seats",       type=int, default=2, metavar="N")
-    p_ck.add_argument("--features",        default="rag_chat,transcriber", metavar="FEAT1,FEAT2")
-    p_ck.add_argument("--minutes",         type=float, default=525600.0, metavar="N",
-                      help="License validity in minutes; floats allowed e.g. 2.0 = 2 minutes (default: 525600 = 365 days)")
-    p_ck.add_argument("--db",              default=None, metavar="PATH",
+    p_ck.add_argument("--customer-name",    required=True, metavar="NAME",
+                      help="e.g. 'M\u00fcller GmbH'")
+    p_ck.add_argument("--max-seats",        type=int, default=2, metavar="N")
+    p_ck.add_argument("--features",         default="rag_chat,transcriber", metavar="FEAT1,FEAT2")
+    p_ck.add_argument("--license-minutes",  type=float, default=10080.0, metavar="N",
+                      help="How long each issued license.json window lasts in minutes "
+                           "(default: 10080 = 7 days). Heartbeat renews with this same window.")
+    p_ck.add_argument("--subscription-days", type=float, default=365.0, metavar="N",
+                      help="How long the activation key itself stays valid in days "
+                           "(default: 365). After this the server refuses renewals.")
+    p_ck.add_argument("--db",               default=None, metavar="PATH",
                       help="Path to seats.db (default: seats.db)")
 
     # --- activate (client) ---

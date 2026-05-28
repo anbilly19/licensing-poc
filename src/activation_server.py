@@ -25,7 +25,7 @@ Error code reference (internal, never exposed to clients):
     E1003 — internal activation error
     E2001 — machine not recognised during heartbeat
     E2002 — activation key not found during heartbeat
-    E2003 — license validation period ended; contact vendor
+    E2003 — subscription expired; contact vendor
     E2004 — internal heartbeat error
     E3001 — admin bearer token missing
     E3002 — admin bearer token invalid
@@ -89,21 +89,23 @@ class HeartbeatResponse(BaseModel):
 
 
 class CreateKeyRequest(BaseModel):
-    activation_key:  str
-    customer_id:     str
-    customer_name:   str
-    max_seats:       int        = 2
-    features:        List[str]  = ["rag_chat"]
-    minutes_valid:   float      = 525600.0  # 365 days default; use small values for testing
+    activation_key:   str
+    customer_id:      str
+    customer_name:    str
+    max_seats:        int        = 2
+    features:         List[str]  = ["rag_chat"]
+    license_minutes:  float      = 10080.0   # window of each issued license.json (default: 7 days)
+    subscription_days: float     = 365.0     # how long the activation key itself is valid
 
 
 class CreateKeyResponse(BaseModel):
-    activation_key: str
-    customer_id:    str
-    customer_name:  str
-    max_seats:      int
-    features:       List[str]
-    minutes_valid:  float
+    activation_key:   str
+    customer_id:      str
+    customer_name:    str
+    max_seats:        int
+    features:         List[str]
+    license_minutes:  float
+    subscription_days: float
 
 
 # ---------------------------------------------------------------------------
@@ -126,9 +128,9 @@ def _require_admin(authorization: str = Header(...)) -> None:
 def activate(req: ActivateRequest) -> ActivateResponse:
     """Client calls this on first run to obtain a signed license.
 
-    1. Validates the activation key exists and hasn't expired.
+    1. Validates the activation key exists and subscription hasn't expired.
     2. Checks seat count for that key.
-    3. Signs and returns license.json payload.
+    3. Signs and returns license.json payload with a license_minutes window.
     """
     try:
         lic = issue_license_for_activation(
@@ -154,8 +156,8 @@ def activate(req: ActivateRequest) -> ActivateResponse:
 def heartbeat(req: HeartbeatRequest) -> HeartbeatResponse:
     """Client calls this periodically to renew the license.
 
-    - If the activation key is still valid and machine is known: re-sign and return.
-    - If revoked / expired: return {valid: false, code: <Exxxx>}.
+    - Re-issues a fresh license_minutes window if subscription is still valid.
+    - Returns {valid: false, code: E2003} if the subscription has expired.
     """
     conn = _init_db(_DB_PATH)
 
@@ -163,14 +165,13 @@ def heartbeat(req: HeartbeatRequest) -> HeartbeatResponse:
         return HeartbeatResponse(valid=False, code="E2001")
 
     row = conn.execute(
-        "SELECT customer_id, customer_name, max_seats, features, minutes_valid, expires_at "
-        "FROM activation_keys WHERE activation_key = ?",
+        "SELECT expires_at FROM activation_keys WHERE activation_key = ?",
         (req.activation_key,),
     ).fetchone()
     if row is None:
         return HeartbeatResponse(valid=False, code="E2002")
 
-    _, _, _, _, minutes_valid, expires_at = row
+    (expires_at,) = row
     now = datetime.now(timezone.utc)
     if expires_at:
         exp_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
@@ -204,7 +205,8 @@ def admin_create_key(req: CreateKeyRequest) -> CreateKeyResponse:
         customer_name=req.customer_name,
         max_seats=req.max_seats,
         features=req.features,
-        minutes_valid=req.minutes_valid,
+        license_minutes=req.license_minutes,
+        subscription_days=req.subscription_days,
         db_path=_DB_PATH,
     )
     return CreateKeyResponse(
@@ -213,7 +215,8 @@ def admin_create_key(req: CreateKeyRequest) -> CreateKeyResponse:
         customer_name=req.customer_name,
         max_seats=req.max_seats,
         features=req.features,
-        minutes_valid=req.minutes_valid,
+        license_minutes=req.license_minutes,
+        subscription_days=req.subscription_days,
     )
 
 

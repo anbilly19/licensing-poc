@@ -38,17 +38,37 @@ def _init_db(db_path: Path) -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS activation_keys (
-            activation_key   TEXT PRIMARY KEY,
-            customer_id      TEXT NOT NULL,
-            customer_name    TEXT NOT NULL,
-            max_seats        INTEGER NOT NULL DEFAULT 2,
-            features         TEXT NOT NULL DEFAULT 'rag_chat',
-            minutes_valid    REAL NOT NULL DEFAULT 525600,
-            created_at       TEXT NOT NULL,
-            expires_at       TEXT
+            activation_key      TEXT PRIMARY KEY,
+            customer_id         TEXT NOT NULL,
+            customer_name       TEXT NOT NULL,
+            max_seats           INTEGER NOT NULL DEFAULT 2,
+            features            TEXT NOT NULL DEFAULT 'rag_chat',
+            license_minutes     REAL NOT NULL DEFAULT 10080,
+            subscription_days   REAL NOT NULL DEFAULT 365,
+            created_at          TEXT NOT NULL,
+            expires_at          TEXT
         )
         """
     )
+    # Migrate old schema: add new columns if they don't exist yet.
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(activation_keys)")}
+    if "license_minutes" not in existing:
+        conn.execute(
+            "ALTER TABLE activation_keys ADD COLUMN license_minutes REAL NOT NULL DEFAULT 10080"
+        )
+    if "subscription_days" not in existing:
+        conn.execute(
+            "ALTER TABLE activation_keys ADD COLUMN subscription_days REAL NOT NULL DEFAULT 365"
+        )
+    # Back-fill legacy rows: treat minutes_valid as license_minutes if present.
+    if "minutes_valid" in existing:
+        conn.execute(
+            """
+            UPDATE activation_keys
+            SET license_minutes = minutes_valid
+            WHERE license_minutes = 10080
+            """
+        )
     conn.commit()
     return conn
 
@@ -82,28 +102,46 @@ def create_activation_key(
     customer_name: str,
     max_seats: int = 2,
     features: List[str] = None,
-    minutes_valid: float = 525600.0,  # 365 days default
+    license_minutes: float = 10080.0,   # window of each issued license.json (default: 7 days)
+    subscription_days: float = 365.0,   # how long the activation key itself is valid
+    # Legacy alias kept for callers that still pass minutes_valid
+    minutes_valid: Optional[float] = None,
     db_path: Path = DEFAULT_DB_PATH,
     now: Optional[datetime] = None,
 ) -> None:
-    """Register a new activation key for a customer (vendor operation)."""
+    """Register a new activation key for a customer (vendor operation).
+
+    license_minutes   — how long each issued license.json window lasts (e.g. 10080 = 7 days).
+                        Heartbeat renews with this same window each time.
+    subscription_days — how long the activation key itself stays valid before the
+                        server refuses heartbeat renewals (e.g. 365 = 1 year subscription).
+    """
+    # Backwards-compat: old callers pass minutes_valid which maps to license_minutes.
+    if minutes_valid is not None:
+        license_minutes = minutes_valid
+
     if now is None:
         now = datetime.now(timezone.utc)
     if features is None:
         features = ["rag_chat"]
+
     conn = _init_db(db_path)
-    expires_at = (now + timedelta(minutes=minutes_valid)).isoformat().replace("+00:00", "Z")
+    key_expires_at = (
+        (now + timedelta(days=subscription_days)).isoformat().replace("+00:00", "Z")
+    )
     conn.execute(
         """
         INSERT INTO activation_keys
-            (activation_key, customer_id, customer_name, max_seats, features, minutes_valid, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (activation_key, customer_id, customer_name, max_seats, features,
+             license_minutes, subscription_days, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(activation_key) DO UPDATE SET
-            customer_name  = excluded.customer_name,
-            max_seats      = excluded.max_seats,
-            features       = excluded.features,
-            minutes_valid  = excluded.minutes_valid,
-            expires_at     = excluded.expires_at
+            customer_name     = excluded.customer_name,
+            max_seats         = excluded.max_seats,
+            features          = excluded.features,
+            license_minutes   = excluded.license_minutes,
+            subscription_days = excluded.subscription_days,
+            expires_at        = excluded.expires_at
         """,
         (
             activation_key,
@@ -111,27 +149,27 @@ def create_activation_key(
             customer_name,
             max_seats,
             json.dumps(features),
-            minutes_valid,
+            license_minutes,
+            subscription_days,
             now.isoformat().replace("+00:00", "Z"),
-            expires_at,
+            key_expires_at,
         ),
     )
     conn.commit()
 
-    # Human-readable validity summary
-    if minutes_valid < 60:
-        validity_str = f"{minutes_valid:.1f} minutes"
-    elif minutes_valid < 1440:
-        validity_str = f"{minutes_valid / 60:.2f} hours"
+    if license_minutes < 60:
+        lic_str = f"{license_minutes:.1f} minutes"
+    elif license_minutes < 1440:
+        lic_str = f"{license_minutes / 60:.2f} hours"
     else:
-        validity_str = f"{minutes_valid / 1440:.1f} days"
+        lic_str = f"{license_minutes / 1440:.1f} days"
 
     print(f"Activation key created: {activation_key}")
-    print(f"  customer : {customer_name} ({customer_id})")
-    print(f"  seats    : {max_seats}")
-    print(f"  features : {', '.join(features)}")
-    print(f"  valid    : {validity_str}")
-    print(f"  expires  : {expires_at}")
+    print(f"  customer         : {customer_name} ({customer_id})")
+    print(f"  seats            : {max_seats}")
+    print(f"  features         : {', '.join(features)}")
+    print(f"  license window   : {lic_str} (each issued license.json is valid this long)")
+    print(f"  subscription     : {subscription_days:.1f} days (key expires: {key_expires_at})")
 
 
 def issue_license(
@@ -226,35 +264,35 @@ def issue_license_for_activation(
 ) -> Dict[str, Any]:
     """Issue a license against a registered activation key.
 
-    This is the server-side path called by the activation endpoint.
-    Validates the activation key, checks seat count, signs and returns the license.
+    This is the server-side path called by /activate and /heartbeat.
+    Uses license_minutes for the issued window; checks expires_at (subscription)
+    to decide whether renewal is still permitted.
     """
     if now is None:
         now = datetime.now(timezone.utc)
 
     conn = _init_db(db_path)
 
-    # Look up the activation key
     row = conn.execute(
-        "SELECT customer_id, customer_name, max_seats, features, minutes_valid, expires_at "
+        "SELECT customer_id, customer_name, max_seats, features, license_minutes, expires_at "
         "FROM activation_keys WHERE activation_key = ?",
         (activation_key,),
     ).fetchone()
     if row is None:
         raise InvalidActivationKeyError(f"Activation key '{activation_key}' not found.")
 
-    customer_id, customer_name, max_seats, features_json, minutes_valid, expires_at = row
+    customer_id, customer_name, max_seats, features_json, license_minutes, expires_at = row
     features = json.loads(features_json)
 
-    # Check key expiry
+    # Subscription expiry check — independent of the license window length.
     if expires_at:
         exp_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
         if now > exp_dt:
             raise InvalidActivationKeyError(
-                f"Activation key '{activation_key}' expired at {expires_at}."
+                f"Activation key '{activation_key}' subscription expired at {expires_at}."
             )
 
-    # Seat cap check (per activation key)
+    # Seat cap check (per activation key).
     is_renewal = _is_known_machine(conn, machine_fingerprint)
     if not is_renewal:
         seats_used = _count_seats_for_key(conn, activation_key)
@@ -269,7 +307,7 @@ def issue_license_for_activation(
         private_key_path=private_key_path,
         db_path=db_path,
         max_seats=max_seats,
-        minutes_valid=float(minutes_valid),
+        minutes_valid=float(license_minutes),
         now=now,
         customer=customer_name,
         customer_id=customer_id,
@@ -286,7 +324,7 @@ def issue_and_write(
     minutes_valid: float = 60.0,
     bundle: bool = False,
 ) -> Path:
-    """issue_license + write to disk. Used by the CLI."""
+    """issue_license + write to disk. Used by the CLI `issue` command."""
     conn = _init_db(db_path)
     is_renewal = _is_known_machine(conn, machine_fingerprint)
 
