@@ -130,10 +130,11 @@ def test_not_yet_valid_raises_E0043(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_nuitka_env_guard_raises(env, monkeypatch):
-    """NUITKA_ONEFILE_DIRECTORY set -> SystemExit E0002."""
+    """NUITKA_ONEFILE_DIRECTORY set + exe inside extraction dir -> SystemExit E0002."""
     monkeypatch.setenv("NUITKA_ONEFILE_DIRECTORY", "/tmp/fake")
-    with pytest.raises(SystemExit, match="E0002"):
-        _load(env, now=NOW)
+    with patch("src.license_core._in_nuitka_extraction_context", return_value=True):
+        with pytest.raises(SystemExit, match="E0002"):
+            _load(env, now=NOW)
 
 
 # ---------------------------------------------------------------------------
