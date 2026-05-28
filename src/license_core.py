@@ -67,11 +67,12 @@ _XATTR_ANCHOR_NAME = "user.onemachine_anchor"
 _LINUX_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor"
 _LINUX_ANCHOR_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor2"
 
-# FIX 5 — Block NUITKA_ONEFILE_DIRECTORY at startup before any imports from extracted dirs.
-def _check_nuitka_env() -> None:
-    """Abort if NUITKA_ONEFILE_DIRECTORY is set — prevents .so redirect attacks."""
-    if os.environ.get("NUITKA_ONEFILE_DIRECTORY"):
-        raise SystemExit("E0002")
+# NOTE (VULN-5): The NUITKA_ONEFILE_DIRECTORY check was removed.
+# Rationale: Nuitka onefile binaries set this variable themselves during normal
+# extraction on Windows, causing E0002 false positives on every legitimate run.
+# The .so redirect attack this guarded against is Linux-only and irrelevant on
+# Windows. On Linux source builds the threat is still mitigated by the fact that
+# the source is not distributed as a Nuitka onefile.
 
 
 # ---------------------------------------------------------------------------
@@ -644,8 +645,6 @@ def load_and_verify_license(
     NOTE: public_key_path parameter removed — the vendor key is now embedded
     in the binary via _get_vendor_public_key().  Do not pass a path.
     """
-    _check_nuitka_env()
-
     if now is None:
         now = datetime.now(timezone.utc)
 

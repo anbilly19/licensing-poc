@@ -78,3 +78,12 @@ def test_missing_license_file_raises(env):
     env["lic"].unlink()
     with pytest.raises(LicenseError, match="E0040"):
         _load(env)
+
+
+def test_vendor_public_key_missing_raises_E0001(env, tmp_path, monkeypatch):
+    """E0001 is raised when no embedded key and no public_key.pem on disk."""
+    import src.license_core as lc
+    monkeypatch.setattr(lc, "_VENDOR_PUBLIC_KEY_PEM", None)
+    monkeypatch.setattr(lc, "_VENDOR_PUBLIC_KEY_FILE", tmp_path / "no_key.pem")
+    with pytest.raises(LicenseError, match="E0001"):
+        lc._get_vendor_public_key()
