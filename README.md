@@ -224,21 +224,86 @@ Download the binary for your platform from [Releases](../../releases).
 | Linux | `onemachine-license-linux` |
 | macOS | `onemachine-license-mac` |
 
-### Client (Laptops B & C)
+### Client setup
 
 1. Download the binary for your platform.
-2. Run activation (requires internet access to the activation server):
+2. **Place `public_key.pem` in the same folder as the EXE** (see [Public key distribution](#public-key-distribution) below).
+3. Run activation (requires network access to the activation server):
    ```
    onemachine-license-win.exe activate --activation-key YOUR-KEY-HERE
    ```
-3. Run the demo:
+4. Run the demo:
    ```
    onemachine-license-win.exe demo
    ```
 
 > The activation server URL is baked into the binary at build time via the
 > `_ACTIVATION_SERVER_URL` constant in `src/activation_client.py`. For dev builds,
-> set `ACTIVATION_SERVER_URL=http://localhost:8000` in the environment.
+> set `ACTIVATION_SERVER_URL=http://<vendor-ip>:8000` in the environment.
+
+---
+
+## Public key distribution
+
+> ⚠️ **This is a critical step.** Skipping it causes **E0001** on the client machine.
+
+The binary needs the vendor Ed25519 public key to verify `license.json`. There are two
+ways to provide it — **embedding (correct for production)** and **file copy (acceptable
+for testing)**.
+
+---
+
+### ✅ Correct method — embed the key at build time (production)
+
+Before running Nuitka, bake `public_key.pem` directly into the binary so it is never
+a separate file that can be substituted or missed:
+
+**Step 1 — Print the key bytes after keygen:**
+
+```bash
+python scripts/print_pubkey_bytes.py
+# Output looks like: b'-----BEGIN PUBLIC KEY-----\n...'
+```
+
+**Step 2 — Paste into `src/license_core.py`:**
+
+```python
+# src/license_core.py  — replace the None with your actual key bytes
+_VENDOR_PUBLIC_KEY_PEM: Optional[bytes] = b'-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n'
+```
+
+**Step 3 — Build the binary:**
+
+```bash
+python -m nuitka \
+  --onefile \
+  --output-filename=onemachine-license-win.exe \
+  --include-package=src \
+  src/cli.py
+```
+
+The resulting EXE carries the public key internally. `public_key.pem` does **not** need
+to exist on the client machine. Do **not** ship `public_key.pem` as a separate file in
+production — an attacker who can replace it can forge licenses.
+
+---
+
+### 🔧 Workaround — copy the file (dev/testing only)
+
+For local LAN testing with a pre-built dev EXE where the key was not embedded:
+
+1. Copy `public_key.pem` from the vendor machine to the **same folder** as the EXE on the client.
+2. Expected folder layout on the client:
+   ```
+   onemachine-license-win.exe
+   public_key.pem          ← copied from vendor
+   license.json            ← written by activate
+   ```
+3. Run `activate` then `demo` as normal.
+
+> ⚠️ Never ship this layout to real customers. A customer who replaces `public_key.pem`
+> with their own key can sign arbitrary licenses. Always use the embedded method for
+> distributed builds.
 
 ---
 
@@ -278,7 +343,7 @@ All sources are read directly from the OS (sysfs, registry, ioreg) — no libc i
 | File | Purpose | Share? |
 |---|---|---|
 | `private_key.pem` | Signs licenses | ❌ Never |
-| `public_key.pem` | Embedded in binary at build time | ❌ Do not distribute |
+| `public_key.pem` | Embedded in binary at build time | ❌ Do not distribute as a standalone file |
 | `seats.db` | Tracks issued seats + activation keys | ❌ Keep on server |
 
 > **One key pair for all customers.** Each customer receives a unique `license.json`
@@ -341,7 +406,7 @@ vulnerabilities. All were addressed in this commit:
 | 2 | High | All three mirrors (`last_seen.json`, mirror, anchor dotfile) could be deleted simultaneously, triggering a cold-start with no rollback check | **Linux:** anchor now written to GNOME Keyring via `secretstorage` (cannot be `rm`-ed by user); cold-start **refused** if any anchor exists |
 | 3 | Medium | Anchor file stored an identical copy of `last_seen.json`'s `sig` — forging one automatically satisfied the other | Two independent HMAC keys: `_HMAC_SALT_PRIMARY` (signs entries) and `_HMAC_SALT_ANCHOR` (signs the anchor MAC separately) |
 | 4 | High | Machine fingerprint used `socket.gethostname()` + `uuid.getnode()` — both interceptable via `LD_PRELOAD` | Fingerprint now derived from `/etc/machine-id` (Linux), `IOPlatformUUID` (macOS), `MachineGuid` registry (Windows) — no libc indirection |
-| 5 | Medium | `NUITKA_ONEFILE_DIRECTORY` env var allowed redirect of extracted `.so` files, enabling full cryptography layer replacement | `_check_nuitka_env()` aborts immediately if the env var is set |
+| 5 | Medium | `NUITKA_ONEFILE_DIRECTORY` env var allowed redirect of extracted `.so` files, enabling full cryptography layer replacement | Guard added inside `load_and_verify_license` — aborts with E0002 if the env var is set at verification time |
 | 6 | Medium | HMAC key constants (`_HMAC_SALT`, `_last_seen_hmac_key`) extractable from Nuitka bytecode | Dual-key split reduces blast radius; full mitigation requires a server-side heartbeat or TPM-sealed key (future work) |
 
 #### 7. Online activation + heartbeat — `2f8ae2e`
@@ -364,7 +429,7 @@ and adds revocation capability:
 | Delete all mirrors + roll back clock | libsecret keychain anchor; cold-start refused (VULN-2 fix) |
 | Forge anchor by copying `last_seen.json` sig | Dual HMAC keys — anchor uses independent salt (VULN-3 fix) |
 | Spoof machine fingerprint via `LD_PRELOAD` | sysfs / registry / ioreg fingerprint sources (VULN-4 fix) |
-| `.so` redirect via `NUITKA_ONEFILE_DIRECTORY` | Env var blocked at startup (VULN-5 fix) |
+| `.so` redirect via `NUITKA_ONEFILE_DIRECTORY` | Env var blocked inside `load_and_verify_license` (VULN-5 fix) |
 | Roll back clock while files intact | NTP check |
 | Roll back clock while offline | Boot-time uptime anchor |
 | VM snapshot restore with mismatched clock | Boot-time anchor (uptime goes backward → ignored; NTP catches online) |
@@ -413,6 +478,11 @@ HMAC, NTP, and anchor writes — but can never forge a license on its own.
 
 ## Build — embed public key before compiling
 
+> ⚠️ **Do not skip this step.** A binary built without the embedded key will fall back
+> to reading `public_key.pem` from disk. If that file is absent on the client machine,
+> the client gets **E0001** immediately after activation. If the file is present but
+> user-controlled, an attacker can substitute their own key and forge licenses.
+
 Before running Nuitka, set `_VENDOR_PUBLIC_KEY_PEM` in `src/license_core.py` to your
 actual key bytes:
 
@@ -427,11 +497,11 @@ Paste the output as the value of `_VENDOR_PUBLIC_KEY_PEM` in `src/license_core.p
 then build. Do **not** include `public_key.pem` in the distributed package.
 
 ```bash
-# Example Nuitka onefile build (Linux)
-python -m nuitka \
-  --onefile \
-  --output-filename=onemachine-license-linux \
-  --include-package=src \
+# Example Nuitka onefile build (Windows)
+python -m nuitka ^
+  --onefile ^
+  --output-filename=onemachine-license-win.exe ^
+  --include-package=src ^
   src/cli.py
 ```
 
