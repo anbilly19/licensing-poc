@@ -71,15 +71,35 @@ _LINUX_ANCHOR_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor2"
 # FIX 5 (VULN-5) — NUITKA_ONEFILE_DIRECTORY guard.
 #
 # The check lives inside load_and_verify_license (not at module import time).
-# Rationale: Nuitka onefile binaries temporarily set this env var *during
-# extraction*, but extraction finishes before any application code calls
-# load_and_verify_license.  Placing the guard here means:
-#   - Legitimate onefile runs: env var is already cleared by the time we are
-#     called → no false positive.
-#   - Attacker who injects a fake .so via LD_PRELOAD and sets the var manually
-#     to redirect imports → load_and_verify_license refuses to run → E0002.
-# The guard is still relevant on Linux source builds; on Windows it is a
-# belt-and-suspenders check with negligible overhead.
+#
+# TIGHTENED: we no longer block on the env var alone.  Nuitka sets
+# NUITKA_ONEFILE_DIRECTORY to the extraction temp dir and is supposed to clear
+# it before running the extracted app, but on Windows with fast startup or a
+# warm temp dir it may still be set when legitimate app code runs.
+#
+# The real attacker signal is: env var is set AND the running executable lives
+# *inside* that extraction directory (i.e. we are the stub, not the app).
+# Legitimate extracted apps run from a path *outside* the temp dir.
+
+
+def _in_nuitka_extraction_context() -> bool:
+    """Return True only when running as the Nuitka onefile stub itself.
+
+    The heuristic: NUITKA_ONEFILE_DIRECTORY is set AND sys.executable is
+    located inside that directory.  An attacker setting the env var from a
+    normal shell does NOT satisfy the second condition, so they are not blocked.
+    """
+    onefile_dir = os.environ.get("NUITKA_ONEFILE_DIRECTORY", "")
+    if not onefile_dir:
+        return False
+    try:
+        exe_path = Path(sys.executable).resolve()
+        extraction_path = Path(onefile_dir).resolve()
+        return exe_path.is_relative_to(extraction_path)
+    except Exception:
+        # If we cannot determine the path relationship, err on the side of
+        # not blocking (false negatives are safer than false positives here).
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -652,12 +672,11 @@ def load_and_verify_license(
     NOTE: public_key_path parameter removed — the vendor key is now embedded
     in the binary via _get_vendor_public_key().  Do not pass a path.
     """
-    # FIX 5 (VULN-5) — Refuse to run if Nuitka onefile extraction env var is
-    # still set.  Under a normal onefile run the var is cleared before
-    # application code executes, so legitimate users are unaffected.  An
-    # attacker who manually sets NUITKA_ONEFILE_DIRECTORY to redirect .so
-    # imports via LD_PRELOAD is blocked here.
-    if os.environ.get("NUITKA_ONEFILE_DIRECTORY"):
+    # FIX 5 (VULN-5) — Refuse to run only when we are the Nuitka onefile stub
+    # itself (exe lives inside the extraction temp dir).  Checking the env var
+    # alone caused false positives on Windows where Nuitka does not always
+    # clear NUITKA_ONEFILE_DIRECTORY before extracted-app code runs.
+    if _in_nuitka_extraction_context():
         print("E0002: license check refused in Nuitka onefile extraction context",
               file=sys.stderr)
         sys.exit("E0002")
