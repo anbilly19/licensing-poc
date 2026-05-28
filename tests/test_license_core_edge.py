@@ -56,6 +56,18 @@ def test_vendor_public_key_missing_raises_E0001(env):
             )
 
 
+def test_nuitka_env_guard_raises(env, monkeypatch):
+    """NUITKA_ONEFILE_DIRECTORY set -> load_and_verify_license raises SystemExit E0002."""
+    monkeypatch.setenv("NUITKA_ONEFILE_DIRECTORY", "/tmp/nuitka_fake")
+    with pytest.raises(SystemExit, match="E0002"):
+        load_and_verify_license(
+            license_path=env["lic"],
+            expected_fingerprint=FINGERPRINT,
+            last_seen_path=env["last_seen"],
+            now=NOW,
+        )
+
+
 def test_multiple_sequential_loads_succeed(env):
     """Three loads advancing time should all succeed."""
     for delta in [0, 5, 10]:

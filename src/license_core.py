@@ -10,6 +10,7 @@ import platform
 import socket
 import struct
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -67,12 +68,18 @@ _XATTR_ANCHOR_NAME = "user.onemachine_anchor"
 _LINUX_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor"
 _LINUX_ANCHOR_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor2"
 
-# NOTE (VULN-5): The NUITKA_ONEFILE_DIRECTORY check was removed.
-# Rationale: Nuitka onefile binaries set this variable themselves during normal
-# extraction on Windows, causing E0002 false positives on every legitimate run.
-# The .so redirect attack this guarded against is Linux-only and irrelevant on
-# Windows. On Linux source builds the threat is still mitigated by the fact that
-# the source is not distributed as a Nuitka onefile.
+# FIX 5 (VULN-5) — NUITKA_ONEFILE_DIRECTORY guard.
+#
+# The check lives inside load_and_verify_license (not at module import time).
+# Rationale: Nuitka onefile binaries temporarily set this env var *during
+# extraction*, but extraction finishes before any application code calls
+# load_and_verify_license.  Placing the guard here means:
+#   - Legitimate onefile runs: env var is already cleared by the time we are
+#     called → no false positive.
+#   - Attacker who injects a fake .so via LD_PRELOAD and sets the var manually
+#     to redirect imports → load_and_verify_license refuses to run → E0002.
+# The guard is still relevant on Linux source builds; on Windows it is a
+# belt-and-suspenders check with negligible overhead.
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +652,16 @@ def load_and_verify_license(
     NOTE: public_key_path parameter removed — the vendor key is now embedded
     in the binary via _get_vendor_public_key().  Do not pass a path.
     """
+    # FIX 5 (VULN-5) — Refuse to run if Nuitka onefile extraction env var is
+    # still set.  Under a normal onefile run the var is cleared before
+    # application code executes, so legitimate users are unaffected.  An
+    # attacker who manually sets NUITKA_ONEFILE_DIRECTORY to redirect .so
+    # imports via LD_PRELOAD is blocked here.
+    if os.environ.get("NUITKA_ONEFILE_DIRECTORY"):
+        print("E0002: license check refused in Nuitka onefile extraction context",
+              file=sys.stderr)
+        sys.exit("E0002")
+
     if now is None:
         now = datetime.now(timezone.utc)
 
