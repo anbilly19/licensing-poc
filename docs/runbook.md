@@ -73,7 +73,7 @@ uv run onemachine-license activate --activation-key "DEMO-2026-ABCD-EFGH"
 
 ```bash
 uv run onemachine-license demo
-# Feature-gated REPL. License is re-checked before every command and every 60 s.
+# Feature-gated REPL. License is verified at startup; heartbeat renews silently in the background.
 ```
 
 ### 6. Renew / heartbeat
@@ -90,13 +90,41 @@ uv run onemachine-license heartbeat
 | Scenario | How |
 |---|---|
 | Online activation | Steps 2–5 above on two terminals |
-| Node-locking | Copy `license.json` to a second machine → **E0003** (wrong fingerprint) |
-| Expiry (mid-session) | Issue with `--license-minutes 2` → sit at the REPL → session terminates |
+| Node-locking | Copy `license.json` to a second machine → **E0042** (wrong fingerprint) |
+| Expiry (mid-session) | Issue with `--license-minutes 2` → sit at the REPL → app **warns** but does not force-quit; session continues until natural expiry. Next startup is blocked. |
 | Feature gating | Create key with only `rag_chat` → `transcribe` returns **DENIED** |
 | Seat cap | Activate a 3rd machine on a `--max-seats 2` key → **E1002** |
 | Revocation | Delete the key row from `seats.db` → next heartbeat returns `valid: false` |
 | Offline mode | Stop the server → heartbeat warns but cached license works until `not_after` |
-| Clock rollback | Roll back system clock → **ROLLBACK DETECTED** |
+| Clock rollback | Roll back system clock → **E0036** (ROLLBACK DETECTED) |
+
+---
+
+## Uninstall / clean slate
+
+Use the provided scripts to wipe all license state from a machine before re-activating.
+
+**Windows:**
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\uninstall.ps1
+```
+
+**Linux / macOS:**
+```bash
+bash scripts/uninstall.sh
+```
+
+What gets removed:
+- `license.json`, `last_seen.json`, `public_key.pem`, `fingerprint.txt`
+- Mirror + boot anchor (`%APPDATA%\OneMachine` / `~/.local/share/onemachine` / `~/Library/Application Support/OneMachine`)
+- Platform secret store anchor (registry on Windows, Keychain on macOS, secretstorage/dotfiles on Linux)
+
+After running, re-activate normally:
+```bash
+uv run onemachine-license activate --activation-key YOUR-KEY
+```
+
+> **E0030 / E0031 recovery:** If the app reports a chain inconsistency error, run the uninstall script — it resolves all three storage layers atomically.
 
 ---
 

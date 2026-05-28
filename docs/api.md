@@ -61,7 +61,7 @@ curl -s -X POST http://localhost:8000/admin/create-key \
 
 | Command | Role | Description |
 |---|---|---|
-| `keygen` | Vendor | Generate Ed25519 keypair |
+| `keygen` | Vendor | Generate Ed25519 keypair — writes `private_key.pem` + `public_key.pem` |
 | `create-key` | Vendor | Register an activation key in `seats.db` |
 | `issue` | Vendor (dev) | Manually sign and write a license file (no server) |
 | `fingerprint` | Client | Print this machine's fingerprint |
@@ -76,12 +76,26 @@ curl -s -X POST http://localhost:8000/admin/create-key \
 
 ### Client-side (`license_core.py`)
 
-| Code | Meaning |
-|---|---|
-| E0001 | Public key not found |
-| E0002 | Nuitka onefile environment detected — verification aborted |
-| E0003 | Machine fingerprint mismatch |
-| E0044 | License expired |
+| Code | Meaning | Recovery |
+|---|---|---|
+| E0001 | Public key not found | Embed key in binary (see `build.md`) or ensure `public_key.pem` is present |
+| E0002 | Nuitka onefile extraction context detected — verification refused | Not a user error; stub is running instead of extracted app |
+| E0010 | System clock deviates from NTP by > 90 s | Sync system clock |
+| E0011 | System clock deviates from boot-time estimate by > 90 s | Sync system clock |
+| E0020 | `last_seen.json` unreadable or malformed | Run uninstall script → re-activate |
+| E0021 | `last_seen.json` HMAC invalid (tampered) | Run uninstall script → re-activate |
+| E0030 | Both chain files missing but registry/keychain anchor exists (re-install attack) | Run uninstall script → re-activate |
+| E0031 | Primary `last_seen.json` missing but mirror exists (asymmetric delete) | Run uninstall script → re-activate |
+| E0032 | Mirror missing but primary exists (asymmetric delete) | Run uninstall script → re-activate |
+| E0033 | Primary and mirror chain hashes diverge (tamper) | Run uninstall script → re-activate |
+| E0034 | Registry/keychain anchor signature mismatch | Run uninstall script → re-activate |
+| E0035 | Registry/keychain anchor MAC mismatch | Run uninstall script → re-activate |
+| E0036 | Clock rolled back (now < last_seen timestamp) | Sync system clock |
+| E0040 | `license.json` not found | Run `activate` |
+| E0041 | License signature invalid | Obtain a valid license from vendor |
+| E0042 | Machine fingerprint mismatch | License was issued for a different machine |
+| E0043 | License not yet valid (`not_before` in future) | Check system clock |
+| E0044 | License expired | Run `heartbeat` or contact vendor |
 
 ### Server-side (`activation_server.py`)
 
