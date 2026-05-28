@@ -104,7 +104,8 @@ def create_activation_key(
     features: List[str] = None,
     license_minutes: float = 10080.0,   # window of each issued license.json (default: 7 days)
     subscription_days: float = 365.0,   # how long the activation key itself is valid
-    # Legacy alias kept for callers that still pass minutes_valid
+    # Legacy alias: minutes_valid<=0 means "already expired" subscription;
+    # minutes_valid>0 is treated as the license window only (subscription stays at 365 days).
     minutes_valid: Optional[float] = None,
     db_path: Path = DEFAULT_DB_PATH,
     now: Optional[datetime] = None,
@@ -116,9 +117,16 @@ def create_activation_key(
     subscription_days — how long the activation key itself stays valid before the
                         server refuses heartbeat renewals (e.g. 365 = 1 year subscription).
     """
-    # Backwards-compat: old callers pass minutes_valid which maps to license_minutes.
+    # Backwards-compat: minutes_valid<=0 signals an already-expired subscription
+    # (used in tests to simulate an expired key). minutes_valid>0 maps to license_minutes
+    # for callers that predate the license_minutes/subscription_days split.
     if minutes_valid is not None:
-        license_minutes = minutes_valid
+        if minutes_valid <= 0:
+            # Negative or zero: the subscription itself should be already expired.
+            # Convert minutes to days (negative) so expires_at ends up in the past.
+            subscription_days = minutes_valid / 1440.0
+        else:
+            license_minutes = minutes_valid
 
     if now is None:
         now = datetime.now(timezone.utc)
