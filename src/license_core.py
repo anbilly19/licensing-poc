@@ -54,19 +54,19 @@ def _get_vendor_public_key() -> bytes:
 
 
 # Windows registry paths.
-_REGISTRY_KEY = r"Software\OneMachine\LicensePOC"
+_REGISTRY_KEY = r"Software\LicensePOC"
 _REGISTRY_VALUE = "last_seen_sig"
 _REGISTRY_ANCHOR_VALUE = "last_seen_anchor"
 
 # macOS Keychain service name (used by keyring library)
-_MACOS_KEYCHAIN_SERVICE = "com.onemachine.licensepoc"
+_MACOS_KEYCHAIN_SERVICE = "com.licensing-poc.app"
 _MACOS_KEYCHAIN_SIG_USER    = "last_seen_sig"
 _MACOS_KEYCHAIN_ANCHOR_USER = "last_seen_anchor"
 
-_XATTR_NAME = "user.onemachine_sig"
-_XATTR_ANCHOR_NAME = "user.onemachine_anchor"
-_LINUX_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor"
-_LINUX_ANCHOR_DOTFILE = Path.home() / ".config" / ".onemachine" / "anchor2"
+_XATTR_NAME = "user.licensing_poc_sig"
+_XATTR_ANCHOR_NAME = "user.licensing_poc_anchor"
+_LINUX_DOTFILE = Path.home() / ".config" / ".licensing-poc" / "anchor"
+_LINUX_ANCHOR_DOTFILE = Path.home() / ".config" / ".licensing-poc" / "anchor2"
 
 # FIX 5 (VULN-5) — NUITKA_ONEFILE_DIRECTORY guard.
 #
@@ -105,8 +105,8 @@ def _in_nuitka_extraction_context() -> bool:
 # ---------------------------------------------------------------------------
 # FIX 3 — Two independent HMAC keys.
 # ---------------------------------------------------------------------------
-_HMAC_SALT_PRIMARY = b"0m-p0c-s4lt-v1-primary-d3f4ult-ch4ng3-b3f0r3-pr0d"
-_HMAC_SALT_ANCHOR  = b"0m-p0c-s4lt-v1-anchor--d3f4ult-ch4ng3-b3f0r3-pr0d"
+_HMAC_SALT_PRIMARY = b"lic-p0c-s4lt-v1-primary-d3f4ult-ch4ng3-b3f0r3-pr0d"
+_HMAC_SALT_ANCHOR  = b"lic-p0c-s4lt-v1-anchor--d3f4ult-ch4ng3-b3f0r3-pr0d"
 
 _CLOCK_SKEW_TOLERANCE = timedelta(seconds=90)
 _NTP_SERVERS = ["time.cloudflare.com", "pool.ntp.org", "time.google.com"]
@@ -153,12 +153,12 @@ def _get_mirror_path() -> Path:
     system = _system()
     if system == "Windows":
         appdata = os.environ.get("APPDATA", str(Path.home()))
-        mirror_dir = Path(appdata) / "OneMachine"
+        mirror_dir = Path(appdata) / "LicensePOC"
     elif system == "Darwin":
-        mirror_dir = Path.home() / "Library" / "Application Support" / "OneMachine"
+        mirror_dir = Path.home() / "Library" / "Application Support" / "LicensePOC"
     else:
         xdg = os.environ.get("XDG_DATA_HOME", "")
-        mirror_dir = (Path(xdg) if xdg else Path.home() / ".local" / "share") / "onemachine"
+        mirror_dir = (Path(xdg) if xdg else Path.home() / ".local" / "share") / "licensing-poc"
     mirror_dir.mkdir(parents=True, exist_ok=True)
     return mirror_dir / "last_seen.json"
 
@@ -312,9 +312,9 @@ def _check_clock_sanity(now: datetime, key: bytes) -> None:
 # FIX 2 — libsecret anchor (Linux)
 # ---------------------------------------------------------------------------
 
-_LIBSECRET_SERVICE = "onemachine-licensing"
-_LIBSECRET_ATTR = {"app": "onemachine", "type": "last_seen_sig"}
-_LIBSECRET_ANCHOR_ATTR = {"app": "onemachine", "type": "last_seen_anchor"}
+_LIBSECRET_SERVICE = "licensing-poc"
+_LIBSECRET_ATTR = {"app": "licensing-poc", "type": "last_seen_sig"}
+_LIBSECRET_ANCHOR_ATTR = {"app": "licensing-poc", "type": "last_seen_anchor"}
 
 
 def _libsecret_write(sig: str, anchor_mac: str) -> bool:
@@ -364,7 +364,7 @@ def _dpapi_encrypt(plaintext: str) -> Optional[bytes]:
         import win32crypt  # type: ignore
         encrypted = win32crypt.CryptProtectData(
             plaintext.encode("utf-8"),
-            "onemachine-anchor",
+            "licensing-poc-anchor",
             None, None, None, 0,
         )
         return encrypted
