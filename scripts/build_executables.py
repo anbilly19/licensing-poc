@@ -4,8 +4,8 @@ Usage (run from repo root with uv):
     uv run python scripts/build_executables.py
 
 Outputs to dist/:
-    onemachine-license          (Linux/macOS)
-    onemachine-license.exe      (Windows)
+    poc-license          (Linux/macOS)
+    poc-license.exe      (Windows)
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def main() -> None:
     dist.mkdir(exist_ok=True)
 
     system = platform.system()
-    exe_name = "onemachine-license" + (".exe" if system == "Windows" else "")
+    exe_name = "poc-license" + (".exe" if system == "Windows" else "")
     output_path = dist / exe_name
 
     cmd = [

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OneMachine Licensing POC — Linux/macOS Uninstall Script
+# Licensing POC — Linux/macOS Uninstall Script
 # Clears all license state so a fresh activate can run cleanly.
 # Usage: bash scripts/uninstall.sh [--dir <license-dir>] [--quiet]
 
@@ -25,7 +25,7 @@ rm_if_exists() {
 }
 
 echo ""
-echo "OneMachine — clearing license state ($(uname -s))"
+echo "Licensing POC — clearing license state ($(uname -s))"
 echo ""
 
 # 1. Local working-directory files
@@ -38,16 +38,16 @@ OS="$(uname -s)"
 
 if [ "$OS" = "Darwin" ]; then
   # 2. macOS — Application Support mirror
-  rm_if_exists "$HOME/Library/Application Support/OneMachine"
+  rm_if_exists "$HOME/Library/Application Support/LicensePOC"
 
   # 3. macOS Keychain entries (via keyring; ignore if not installed)
   python3 -c "
 import sys
 try:
     import keyring
-    keyring.delete_password('com.onemachine.licensepoc', 'last_seen_sig')
-    keyring.delete_password('com.onemachine.licensepoc', 'last_seen_anchor')
-    print('  removed: Keychain entries (com.onemachine.licensepoc)')
+    keyring.delete_password('com.licensing-poc.app', 'last_seen_sig')
+    keyring.delete_password('com.licensing-poc.app', 'last_seen_anchor')
+    print('  removed: Keychain entries (com.licensing-poc.app)')
 except Exception as e:
     print(f'  keychain: {e} (skipped)')
 " 2>/dev/null || true
@@ -55,10 +55,10 @@ except Exception as e:
 elif [ "$OS" = "Linux" ]; then
   # 2. Linux — XDG data mirror
   XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
-  rm_if_exists "$XDG_DATA/onemachine"
+  rm_if_exists "$XDG_DATA/licensing-poc"
 
   # 3a. Linux dotfile anchor
-  rm_if_exists "$HOME/.config/.onemachine"
+  rm_if_exists "$HOME/.config/.licensing-poc"
 
   # 3b. libsecret entries (via secretstorage; ignore if not installed)
   python3 -c "
@@ -69,8 +69,8 @@ try:
     coll = secretstorage.get_default_collection(conn)
     if coll.is_locked(): coll.unlock()
     for attr in [
-        {'app': 'onemachine', 'type': 'last_seen_sig'},
-        {'app': 'onemachine', 'type': 'last_seen_anchor'},
+        {'app': 'licensing-poc', 'type': 'last_seen_sig'},
+        {'app': 'licensing-poc', 'type': 'last_seen_anchor'},
     ]:
         for item in coll.search_items(attr):
             item.delete()
@@ -81,10 +81,10 @@ except Exception as e:
 
   # 3c. xattr on last_seen.json if it still exists (belt-and-suspenders)
   if command -v attr &>/dev/null && [ -f "$LICENSE_DIR/last_seen.json" ]; then
-    attr -r user.onemachine_sig    "$LICENSE_DIR/last_seen.json" 2>/dev/null || true
-    attr -r user.onemachine_anchor "$LICENSE_DIR/last_seen.json" 2>/dev/null || true
+    attr -r user.licensing_poc_sig    "$LICENSE_DIR/last_seen.json" 2>/dev/null || true
+    attr -r user.licensing_poc_anchor "$LICENSE_DIR/last_seen.json" 2>/dev/null || true
   fi
 fi
 
 echo ""
-echo "Done. Run 'onemachine-license activate --activation-key YOUR-KEY' to re-activate."
+echo "Done. Run 'poc-license activate --activation-key YOUR-KEY' to re-activate."

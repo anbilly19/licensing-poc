@@ -35,16 +35,16 @@ Optional flags:
 - `fingerprint.txt`
 
 **Windows**
-- `%APPDATA%\OneMachine\` (mirror + boot anchor)
-- `HKLM\Software\OneMachine\LicensePOC`
-- `HKCU\Software\OneMachine\LicensePOC`
+- `%APPDATA%\LicensePOC\` (mirror + boot anchor)
+- `HKLM\Software\LicensePOC`
+- `HKCU\Software\LicensePOC`
 
 **macOS**
-- `~/Library/Application Support/OneMachine/`
-- Keychain entries under `com.onemachine.licensepoc`
+- `~/Library/Application Support/LicensePOC/`
+- Keychain entries under `com.licensing-poc.app`
 
 **Linux**
-- `$XDG_DATA_HOME/onemachine/` (or `~/.local/share/onemachine/`)
-- `~/.config/.onemachine/` (dotfile anchor)
-- secretstorage entries (`app=onemachine`)
-- xattr `user.onemachine_sig` / `user.onemachine_anchor` on `last_seen.json`
+- `$XDG_DATA_HOME/licensing-poc/` (or `~/.local/share/licensing-poc/`)
+- `~/.config/.licensing-poc/` (dotfile anchor)
+- secretstorage entries (`app=licensing-poc`)
+- xattr `user.licensing_poc_sig` / `user.licensing_poc_anchor` on `last_seen.json`
