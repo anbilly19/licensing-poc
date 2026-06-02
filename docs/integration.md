@@ -1,6 +1,6 @@
 # Tauri + Rust Integration
 
-Notes for integrating OneMachine Licensing into a Tauri desktop application.
+Notes for integrating the Licensing POC into a Tauri desktop application.
 
 ---
 

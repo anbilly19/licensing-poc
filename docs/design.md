@@ -56,7 +56,7 @@ Derived from OS-level hardware identifiers — not `gethostname()` or `uuid.getn
 Three independent anchors must agree:
 
 1. **`last_seen.json`** — HMAC-chained entries; each entry signs `(timestamp, prev_hash)` with `_HMAC_SALT_PRIMARY`
-2. **Filesystem / registry anchor** — Linux: xattr + `~/.config/.onemachine/anchor` (or libsecret keyring); Windows: `HKLM` registry key. Signed with `_HMAC_SALT_ANCHOR` (independent key)
+2. **Filesystem / registry anchor** — Linux: xattr + `~/.config/.licensing-poc/anchor` (or libsecret keyring); Windows: `HKLM` registry key. Signed with `_HMAC_SALT_ANCHOR` (independent key)
 3. **Boot-time uptime anchor** — stores `(wall_clock, uptime)` at startup; on next run reconstructs expected wall clock from elapsed uptime
 
 NTP check (Cloudflare → pool.ntp.org → Google) is performed when online; raw UDP, no external dependencies.

@@ -40,7 +40,7 @@ _ACTIVATION_SERVER_URL: Optional[str] = "https://license.yourcompany.com"
 ```bash
 python -m nuitka ^
   --onefile ^
-  --output-filename=onemachine-license-win.exe ^
+  --output-filename=poc-license-win.exe ^
   --include-package=src ^
   src/cli.py
 ```
@@ -50,7 +50,7 @@ python -m nuitka ^
 ```bash
 python -m nuitka \
   --onefile \
-  --output-filename=onemachine-license-linux \
+  --output-filename=poc-license-linux \
   --include-package=src \
   src/cli.py
 ```
@@ -62,7 +62,7 @@ python -m nuitka \
 The binary is self-contained. Clients need **only**:
 
 ```
-onemachine-license-win.exe    ← the compiled binary (public key embedded)
+poc-license-win.exe    ← the compiled binary (public key embedded)
 ```
 
 `license.json` and `last_seen.json` are written by the binary on first run. `public_key.pem` must **not** be included in the distributed package.
@@ -76,7 +76,7 @@ For local testing with a dev build where the key was not embedded:
 1. Copy `public_key.pem` from the vendor machine to the same folder as the EXE.
 2. Layout on the client:
    ```
-   onemachine-license-win.exe
+   poc-license-win.exe
    public_key.pem          ← from vendor
    license.json            ← written by activate
    ```

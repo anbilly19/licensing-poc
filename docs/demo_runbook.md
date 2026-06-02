@@ -1,4 +1,4 @@
-# Demo Runbook — OneMachine Licensing POC
+# Demo Runbook — Licensing POC
 
 Three machines: **Laptop A** (issuer), **Laptop B** (full features, short expiry), **Laptop C** (restricted features).
 

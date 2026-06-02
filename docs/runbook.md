@@ -1,6 +1,6 @@
 # Runbook
 
-Step-by-step guide for setting up, testing, and releasing OneMachine Licensing.
+Step-by-step guide for setting up, testing, and releasing the Licensing POC.
 
 ---
 
@@ -11,8 +11,8 @@ Step-by-step guide for setting up, testing, and releasing OneMachine Licensing.
 curl -LsSf https://astral.sh/uv/install.sh | sh   # Linux/macOS
 # Windows: powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-git clone https://github.com/anbilly19/onemachine-licensing-poc.git
-cd onemachine-licensing-poc
+git clone https://github.com/anbilly19/licensing-poc.git
+cd licensing-poc
 uv sync
 uv pip install fastapi uvicorn
 ```
@@ -24,7 +24,7 @@ uv pip install fastapi uvicorn
 ### 1. Generate keypair
 
 ```bash
-uv run onemachine-license keygen
+uv run poc-license keygen
 # Writes: private_key.pem  public_key.pem
 ```
 
@@ -47,7 +47,7 @@ export ADMIN_TOKEN=my-secret-token   # default: change-me-in-production
 ### 3. Create an activation key (Terminal 2)
 
 ```bash
-uv run onemachine-license create-key \
+uv run poc-license create-key \
   --activation-key  "DEMO-2026-ABCD-EFGH" \
   --customer-id     "cust-de-0042" \
   --customer-name   "Müller GmbH" \
@@ -65,21 +65,21 @@ uv run onemachine-license create-key \
 ### 4. Activate a machine
 
 ```bash
-uv run onemachine-license activate --activation-key "DEMO-2026-ABCD-EFGH"
+uv run poc-license activate --activation-key "DEMO-2026-ABCD-EFGH"
 # Writes license.json
 ```
 
 ### 5. Run the demo REPL
 
 ```bash
-uv run onemachine-license demo
+uv run poc-license demo
 # Feature-gated REPL. License is verified at startup; heartbeat renews silently in the background.
 ```
 
 ### 6. Renew / heartbeat
 
 ```bash
-uv run onemachine-license heartbeat
+uv run poc-license heartbeat
 # Re-signs license.json with a fresh validity window
 ```
 
@@ -116,12 +116,12 @@ bash scripts/uninstall.sh
 
 What gets removed:
 - `license.json`, `last_seen.json`, `public_key.pem`, `fingerprint.txt`
-- Mirror + boot anchor (`%APPDATA%\OneMachine` / `~/.local/share/onemachine` / `~/Library/Application Support/OneMachine`)
+- Mirror + boot anchor (`%APPDATA%\LicensePOC` / `~/.local/share/licensing-poc` / `~/Library/Application Support/LicensePOC`)
 - Platform secret store anchor (registry on Windows, Keychain on macOS, secretstorage/dotfiles on Linux)
 
 After running, re-activate normally:
 ```bash
-uv run onemachine-license activate --activation-key YOUR-KEY
+uv run poc-license activate --activation-key YOUR-KEY
 ```
 
 > **E0030 / E0031 recovery:** If the app reports a chain inconsistency error, run the uninstall script — it resolves all three storage layers atomically.
@@ -140,9 +140,9 @@ Binaries are attached to the release as:
 
 | Platform | Binary |
 |---|---|
-| Windows | `onemachine-license-win.exe` |
-| Linux | `onemachine-license-linux` |
-| macOS | `onemachine-license-mac` |
+| Windows | `poc-license-win.exe` |
+| Linux | `poc-license-linux` |
+| macOS | `poc-license-mac` |
 
 > Always rebuild and re-release after security patches. See [`build.md`](build.md) for the full Nuitka compilation steps.
 
