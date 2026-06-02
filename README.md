@@ -1,4 +1,4 @@
-# OneMachine Licensing POC
+# Licensing POC
 
 Minimal proof-of-concept for **offline-capable, node-locked, time-bound, feature-gated** software licensing — with an optional activation server for seat management and renewal.
 
@@ -24,10 +24,10 @@ uv pip install fastapi uvicorn
 uv run uvicorn src.activation_server:app --reload --port 8000
 
 # Terminal 2 — create key + activate
-uv run onemachine-license keygen
-uv run onemachine-license create-key --activation-key "DEMO-KEY" --customer-id "cust-001" --customer-name "Acme"
-uv run onemachine-license activate --activation-key "DEMO-KEY"
-uv run onemachine-license demo
+uv run poc-license keygen
+uv run poc-license create-key --activation-key "DEMO-KEY" --customer-id "cust-001" --customer-name "Acme"
+uv run poc-license activate --activation-key "DEMO-KEY"
+uv run poc-license demo
 ```
 
 See [`docs/runbook.md`](docs/runbook.md) for the full step-by-step walkthrough.

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "onemachine-licensing-poc"
+name = "licensing-poc"
 version = "0.1.0"
 description = "Minimal offline licensing POC: node-locked, time-bound, feature-gated"
 requires-python = ">=3.11"
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-onemachine-license = "src.cli:main"
+poc-license = "src.cli:main"
 
 [dependency-groups]
 dev = [
