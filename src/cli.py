@@ -1,4 +1,4 @@
-"""onemachine-license -- unified CLI entry point.
+"""poc-license -- unified CLI entry point.
 
 Subcommands
 -----------
@@ -117,7 +117,7 @@ def cmd_install(args: argparse.Namespace) -> None:
     print(f"  machine         : {fp}...")
     print(f"  valid until     : {not_after}")
     print(f"  features        : {', '.join(features)}")
-    print("Run: onemachine-license demo")
+    print("Run: poc-license demo")
 
 
 def cmd_demo(_args: argparse.Namespace) -> None:
@@ -127,8 +127,8 @@ def cmd_demo(_args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="onemachine-license",
-        description="OneMachine Licensing POC",
+        prog="poc-license",
+        description="Licensing POC",
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
